@@ -101,6 +101,23 @@ export async function sendEmail(input: {
   );
 }
 
+// Consulta un correo ya enviado. Ojo: POST /conversations/messages responde 200
+// aunque la entrega falle (p. ej. servicio de correo vencido en la subcuenta),
+// así que hay que revisar el `status` aquí para no cantar victoria de más.
+export async function getEmailMessage(emailMessageId: string) {
+  return req(
+    `/conversations/messages/email/${emailMessageId}`,
+    undefined,
+    V_CONVERSATIONS
+  );
+}
+
+export function emailStatusFrom(body: unknown): { status?: string; error?: string } {
+  const m = (body as { emailMessage?: { status?: string; error?: string } })
+    ?.emailMessage;
+  return { status: m?.status, error: m?.error };
+}
+
 // Busca un contacto por correo dentro de la subcuenta.
 export async function findContactByEmail(email: string) {
   const loc = process.env.GHL_LOCATION_ID;

@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Resend } from "resend";
-import { ensureContactId, ghlEmailReady, sendEmail } from "@/lib/ghl";
+import {
+  emailStatusFrom,
+  ensureContactId,
+  getEmailMessage,
+  ghlEmailReady,
+  sendEmail,
+} from "@/lib/ghl";
 import { SESSION_COOKIE, verifySession } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -125,6 +131,24 @@ async function sendWithGhl(input: {
     messageId?: string;
     emailMessageId?: string;
   };
+
+  // GHL responde 200 aunque no lo entregue: confirmamos el estado real.
+  if (b?.emailMessageId) {
+    const check = await getEmailMessage(b.emailMessageId);
+    const { status, error } = emailStatusFrom(check.body);
+    if (status === "failed") {
+      return NextResponse.json(
+        {
+          error:
+            error === "Configured email service is expired"
+              ? "GHL no lo entregó: el servicio de correo de la subcuenta está vencido. Renuévalo en GHL (Ajustes → Email Services)."
+              : `GHL no entregó el correo: ${error || "razón desconocida"}.`,
+        },
+        { status: 502 }
+      );
+    }
+  }
+
   return NextResponse.json({
     ok: true,
     provider: "ghl",

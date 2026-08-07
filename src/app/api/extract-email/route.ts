@@ -158,44 +158,93 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "URL inválida." }, { status: 400 });
     }
 
-    // Rutas candidatas según sea sitio propio o red social.
-    const candidates = isSocial(host)
-      ? [base, `${base.replace(/\/$/, "")}/about`]
-      : [
-          base,
-          `${origin}/contacto`,
-          `${origin}/contactenos`,
-          `${origin}/contactanos`,
-          `${origin}/contact`,
-          `${origin}/aviso-de-privacidad`,
-          `${origin}/aviso-de-privacidad.html`,
-          `${origin}/privacidad`,
-          `${origin}/nosotros`,
-          `${origin}/quienes-somos`,
-        ];
-
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 14000);
+    const timeout = setTimeout(() => controller.abort(), 22000);
 
-    const emails = new Set<string>();
-    const socials = new Set<string>();
-    try {
-      for (const url of candidates) {
-        if (emails.size >= 6) break;
+    // Rastrea un sitio (home + rutas de contacto) y junta correos + redes.
+    async function harvest(siteUrl: string) {
+      const emails = new Set<string>();
+      const socials = new Set<string>();
+      let siteOrigin = siteUrl;
+      let siteHost = "";
+      try {
+        const u = new URL(siteUrl);
+        siteOrigin = u.origin;
+        siteHost = u.hostname;
+      } catch {
+        return { emails, socials };
+      }
+      const pages = isSocial(siteHost)
+        ? [siteUrl, `${siteUrl.replace(/\/$/, "")}/about`]
+        : [
+            siteUrl,
+            `${siteOrigin}/contacto`,
+            `${siteOrigin}/contactenos`,
+            `${siteOrigin}/contactanos`,
+            `${siteOrigin}/contact`,
+            `${siteOrigin}/aviso-de-privacidad`,
+            `${siteOrigin}/privacidad`,
+            `${siteOrigin}/nosotros`,
+            `${siteOrigin}/quienes-somos`,
+          ];
+      for (const url of pages) {
+        if (emails.size >= 8) break;
         const html = await fetchText(url, controller.signal);
         if (!html) continue;
         extractEmails(html).forEach((e) => emails.add(e));
         extractSocials(html).forEach((s) => socials.add(s));
       }
+      return { emails, socials };
+    }
+
+    const bareHost = host.replace(/^www\./, "");
+    let socialsOut = new Set<string>();
+    let usable: string[] = [];
+    let guesses: string[] = [];
+    try {
+      // 1) Rastrea el sitio del negocio.
+      const first = await harvest(base);
+      socialsOut = first.socials;
+      usable = [...first.emails].filter((e) => !isExcluded(e));
+
+      // Dominios "de verdad" descubiertos en los correos (p. ej. la matriz),
+      // distintos del sitio y de redes sociales.
+      const domains = [
+        ...new Set([...first.emails].map((e) => e.split("@")[1]?.toLowerCase())),
+      ].filter((d): d is string => !!d && !isSocial(d));
+      const otherDomains = domains.filter((d) => d !== bareHost);
+
+      // 2) Si no hubo correo útil, intentamos rastrear el dominio de esos correos.
+      if (!usable.length) {
+        for (const d of otherDomains.slice(0, 2)) {
+          const more = await harvest(`https://${d}`);
+          const u = [...more.emails].filter((e) => !isExcluded(e));
+          more.socials.forEach((s) => socialsOut.add(s));
+          if (u.length) {
+            usable = u;
+            break;
+          }
+        }
+      }
+
+      // 3) Si aún nada pero descubrimos un dominio real (p. ej. grupowitt.com
+      //    del aviso de privacidad), SUGERIMOS correos típicos en ese dominio.
+      if (!usable.length) {
+        const guessDomain = otherDomains[0] || (domains.length ? domains[0] : null);
+        if (guessDomain) {
+          guesses = ["contacto", "ventas", "direccion", "info"].map(
+            (r) => `${r}@${guessDomain}`
+          );
+        }
+      }
     } finally {
       clearTimeout(timeout);
     }
 
-    // Excluye por completo los correos legales/privacidad/automáticos.
-    const usable = [...emails].filter((e) => !isExcluded(e));
     return NextResponse.json({
-      emails: rankEmails(usable, host),
-      socials: [...socials].slice(0, 3),
+      emails: rankEmails(usable, bareHost),
+      socials: [...socialsOut].slice(0, 3),
+      guesses,
     });
   } catch (err) {
     console.error("extract-email error", err);

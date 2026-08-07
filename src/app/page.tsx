@@ -123,6 +123,7 @@ export default function Home() {
   const [onlyActive, setOnlyActive] = useState(false);
   const [sortBy, setSortBy] = useState("score");
   const [socials, setSocials] = useState<Record<string, string[]>>({});
+  const [guesses, setGuesses] = useState<Record<string, string[]>>({});
   const [autoProgress, setAutoProgress] = useState<{ done: number; total: number } | null>(null);
   const [mode, setMode] = useState<"google" | "general">("google");
   const [userCoords, setUserCoords] = useState<{ lat: number; lon: number } | null>(null);
@@ -214,6 +215,7 @@ export default function Home() {
         setResults(withCity);
         setSource(data.source || null);
         setSocials({});
+        setGuesses({});
         if (!withCity.length)
           setError(
             `No encontré ${catLabel.toLowerCase()} en ${q}. Prueba otra ciudad o giro.`
@@ -240,6 +242,8 @@ export default function Home() {
       const email: string | undefined = data.emails?.[0];
       if (data.socials?.length)
         setSocials((s) => ({ ...s, [b.id]: data.socials }));
+      if (data.guesses?.length)
+        setGuesses((s) => ({ ...s, [b.id]: data.guesses }));
       setResults((rs) =>
         rs.map((r) => (r.id === b.id ? { ...r, email: email ?? "" } : r))
       );
@@ -298,6 +302,12 @@ export default function Home() {
       },
       { enableHighAccuracy: false, timeout: 10000 }
     );
+  }
+
+  // Elige un correo sugerido (dominio de la matriz) como el correo del negocio.
+  function pickEmail(b: Business, email: string) {
+    setResults((rs) => rs.map((r) => (r.id === b.id ? { ...r, email } : r)));
+    if (isSaved(b)) updateLead(b.id, { email });
   }
 
   // Saca correos de todos los negocios con web, varios en paralelo, con progreso.
@@ -681,12 +691,14 @@ export default function Home() {
                     b={b}
                     city={searchedCity}
                     socials={socials[b.id]}
+                    guesses={guesses[b.id]}
                     waTemplateBody={waTemplateBody}
                     saved={isSaved(b)}
                     extracting={!!extracting[b.id]}
                     onSave={() => addLead(b)}
                     onExtract={() => extractEmail(b)}
                     onCompose={() => setCompose(b)}
+                    onPickEmail={(e) => pickEmail(b, e)}
                   />
                 ))
               : (leads as Lead[]).map((l) => (
@@ -780,22 +792,26 @@ function BusinessCard({
   b,
   city,
   socials,
+  guesses,
   waTemplateBody,
   saved,
   extracting,
   onSave,
   onExtract,
   onCompose,
+  onPickEmail,
 }: {
   b: Business;
   city: string;
   socials?: string[];
+  guesses?: string[];
   waTemplateBody?: string;
   saved: boolean;
   extracting: boolean;
   onSave: () => void;
   onExtract: () => void;
   onCompose: () => void;
+  onPickEmail: (email: string) => void;
 }) {
   const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(
     `"${b.name}" ${city} correo OR contacto OR email`
@@ -908,6 +924,21 @@ function BusinessCard({
                     : "Red"}
               </a>
             ))}
+            {guesses && guesses.length > 0 && (
+              <div className="mt-1 flex w-full flex-wrap items-center gap-1">
+                <span className="text-[11px] text-slate-400">sugeridos:</span>
+                {guesses.slice(0, 3).map((g) => (
+                  <button
+                    key={g}
+                    onClick={() => onPickEmail(g)}
+                    title="Usar este correo sugerido (dominio de la empresa)"
+                    className="rounded-md bg-indigo-50 px-1.5 py-0.5 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100"
+                  >
+                    {g}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         ) : null}
       </div>

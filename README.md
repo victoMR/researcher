@@ -1,36 +1,44 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 🎯 Prospector
 
-## Getting Started
+Herramienta todo-en-uno para investigar clientes potenciales: busca negocios por **giro + ciudad**, los localiza en un **mapa**, saca su **correo** y te deja **mandarles propuesta** — con un mini-CRM de prospectos.
 
-First, run the development server:
+## Qué hace
+
+- **Buscar** negocios por giro (agencias, seminuevos, inmobiliarias/corretaje, talleres) y ciudad de México.
+  - Datos de **OpenStreetMap** (Nominatim + Overpass) — gratis, sin API key.
+- **Mapa** con todos los negocios encontrados (Leaflet + tiles de OSM).
+- **Sacar correo**: al negocio con página web, extrae correos de su home y páginas de contacto.
+- **Prospectos**: guarda leads (en el navegador), cámbiales estado (nuevo / contactado / respondió / descartado), exporta a **CSV**.
+- **Propuesta**: redacta y envía el correo con **Resend**, o ábrelo en tu cliente de correo, o copia el texto.
+
+## Correr en local
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Abre http://localhost:3000 (o el puerto que indique la consola).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Envío de correo (Resend)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Acepta los términos de Resend (link que te dio el asistente, o `vercel integration open resend/resend-email`).
+2. Instala la integración:
+   ```bash
+   vercel integration add resend/resend-email --no-claim
+   ```
+3. Trae las variables de entorno:
+   ```bash
+   vercel env pull
+   ```
+4. En Resend, **verifica tu dominio** y pon el remitente en `RESEND_FROM` (ej. `Ventas <ventas@tudominio.com>`).
 
-## Learn More
+Sin esto, el botón "Enviar con Resend" avisa que falta config; el botón "Abrir en mi correo" funciona siempre.
 
-To learn more about Next.js, take a look at the following resources:
+## Buenas prácticas de envío (¡importante!)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- Cold email masivo desde tu dominio principal **quema tu reputación**. Para lotes grandes, usa dominio aparte + calentamiento + herramienta dedicada (Instantly/Smartlead) — exporta el CSV desde aquí.
+- Manda pocos y calientes. Incluye siempre la línea de baja ("responde BAJA").
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Stack
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Next.js 16 (App Router) · TypeScript · Tailwind · Leaflet · Resend · OpenStreetMap.

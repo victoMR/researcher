@@ -11,8 +11,7 @@ import { SESSION_COOKIE, verifySession } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
-// El remitente es SIEMPRE el usuario logueado (cada vendedor manda con su
-// propio correo). GHL_EMAIL_FROM / RESEND_FROM solo son el respaldo.
+// Correo del usuario logueado (de la cookie de sesión).
 async function senderEmail(req: NextRequest): Promise<string | null> {
   const session = await verifySession(req.cookies.get(SESSION_COOKIE)?.value);
   return session?.email ?? null;
@@ -22,6 +21,37 @@ async function senderEmail(req: NextRequest): Promise<string | null> {
 function displayName(email: string): string {
   const local = email.split("@")[0].replace(/[._-]+/g, " ").trim();
   return local.charAt(0).toUpperCase() + local.slice(1);
+}
+
+// Cómo se arma el remitente:
+//  - "shared" (default): la dirección es siempre GHL_EMAIL_FROM (el buzón SMTP
+//    de GoDaddy, que es el único que ese servidor deja usar), pero el NOMBRE
+//    visible es el del vendedor -> "Aldo (AI Lead Shield) <contact@...>".
+//  - "peruser": la dirección es la del vendedor. Solo sirve con un proveedor
+//    que permita cualquier buzón del dominio (LeadConnector con dominio
+//    dedicado, o Resend con dominio verificado).
+function senderMode(): "shared" | "peruser" {
+  return (process.env.EMAIL_SENDER_MODE || "shared").toLowerCase() === "peruser"
+    ? "peruser"
+    : "shared";
+}
+
+function buildFrom(sender: string | null): string | null {
+  const shared = process.env.GHL_EMAIL_FROM;
+  if (senderMode() === "peruser") return sender || shared || null;
+  if (!shared) return sender;
+  return sender ? `${displayName(sender)} (AI Lead Shield) <${shared}>` : shared;
+}
+
+// Con remitente compartido, el prospecto no ve el correo del vendedor, así que
+// se lo agregamos al pie para que pueda contestarle directo. Si el vendedor ya
+// puso su correo en el cuerpo, no duplicamos.
+function withSignature(html: string, sender: string | null): string {
+  if (senderMode() === "peruser" || !sender) return html;
+  if (html.toLowerCase().includes(sender.toLowerCase())) return html;
+  return `${html}<p style="margin-top:16px">—<br/>${displayName(
+    sender
+  )} · AI Lead Shield<br/><a href="mailto:${sender}">${sender}</a></p>`;
 }
 
 // Quién manda el correo: "ghl" | "resend" | "auto" (default).
@@ -59,14 +89,24 @@ export async function POST(req: NextRequest) {
   const sender = await senderEmail(req);
 
   if (provider() === "ghl") {
-    const from = sender || process.env.GHL_EMAIL_FROM;
+    const from = buildFrom(sender);
     if (!from) {
       return NextResponse.json(
-        { error: "No hay remitente: inicia sesión de nuevo." },
+        {
+          error:
+            "No hay remitente: inicia sesión de nuevo o define GHL_EMAIL_FROM.",
+        },
         { status: 401 }
       );
     }
-    return sendWithGhl({ to, subject, html: body, from, name, phone });
+    return sendWithGhl({
+      to,
+      subject,
+      html: withSignature(body, sender),
+      from,
+      name,
+      phone,
+    });
   }
   return sendWithResend({ to, subject, html: body, text, sender });
 }
@@ -201,13 +241,19 @@ async function sendWithResend(input: {
     );
   }
 
-  // Usa el correo del usuario logueado si es del mismo dominio verificado que
-  // RESEND_FROM; si no, Resend rechazaría el envío y caemos al remitente base.
+  // En "shared" se manda desde la dirección base con el nombre del vendedor.
+  // En "peruser" se usa su propio correo, pero solo si es del mismo dominio
+  // verificado en Resend; si no, Resend rechazaría el envío.
   const domainOf = (s: string) => s.split("@")[1]?.replace(/>$/, "").toLowerCase();
-  const from =
-    input.sender && domainOf(input.sender) === domainOf(fallback)
-      ? `${displayName(input.sender)} <${input.sender}>`
-      : fallback;
+  const addrOf = (s: string) => s.match(/<([^>]+)>/)?.[1] ?? s;
+  let from = fallback;
+  if (input.sender) {
+    if (senderMode() === "shared") {
+      from = `${displayName(input.sender)} (AI Lead Shield) <${addrOf(fallback)}>`;
+    } else if (domainOf(input.sender) === domainOf(fallback)) {
+      from = `${displayName(input.sender)} <${input.sender}>`;
+    }
+  }
 
   try {
     const resend = new Resend(apiKey);

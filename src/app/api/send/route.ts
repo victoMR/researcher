@@ -71,6 +71,22 @@ export async function POST(req: NextRequest) {
   return sendWithResend({ to, subject, html: body, text, sender });
 }
 
+// El estado tarda un momento en asentarse: recién enviado viene "pending" y
+// puede pasar a "failed" un segundo después. Reintentamos para no reportar
+// como enviado algo que GHL acabó rebotando.
+async function confirmDelivery(
+  emailMessageId: string
+): Promise<{ status?: string; error?: string }> {
+  let last: { status?: string; error?: string } = {};
+  for (let i = 0; i < 3; i++) {
+    const check = await getEmailMessage(emailMessageId);
+    last = emailStatusFrom(check.body);
+    if (last.status && last.status !== "pending") return last;
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  return last;
+}
+
 // --- GoHighLevel (Conversations): el correo queda en el hilo del contacto ---
 async function sendWithGhl(input: {
   to: string;
@@ -134,8 +150,7 @@ async function sendWithGhl(input: {
 
   // GHL responde 200 aunque no lo entregue: confirmamos el estado real.
   if (b?.emailMessageId) {
-    const check = await getEmailMessage(b.emailMessageId);
-    const { status, error } = emailStatusFrom(check.body);
+    const { status, error } = await confirmDelivery(b.emailMessageId);
     if (status === "failed") {
       return NextResponse.json(
         {

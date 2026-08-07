@@ -77,6 +77,10 @@ export default function ComposeModal({ lead, onClose, onSent }: Props) {
         body: JSON.stringify({
           to,
           subject,
+          // GHL necesita un contacto: mandamos nombre y teléfono para crearlo
+          // si todavía no existe en la subcuenta.
+          name: lead.name,
+          phone: lead.phone || undefined,
           text: body,
           html: body
             .split("\n")

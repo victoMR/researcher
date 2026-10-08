@@ -32,6 +32,16 @@ try {
   process.exit(1);
 }
 const m = decodeURIComponent(url.username).match(/^[^.]+\.([a-z0-9]{20})$/);
+if (/^db\.[a-z0-9]{20}\.supabase\.co$/.test(url.hostname)) {
+  console.error(
+    [
+      "Esa es la conexión DIRECTA (db.<ref>.supabase.co:5432): Supabase la da solo por IPv6 y Vercel no puede usarla.",
+      'En Supabase → botón "Connect" → Connection String (URI) → baja a "Transaction pooler" y copia esa cadena:',
+      "  postgresql://postgres.<ref>:[YOUR-PASSWORD]@aws-0-<región>.pooler.supabase.com:6543/postgres",
+    ].join("\n")
+  );
+  process.exit(1);
+}
 if (!/pooler\.supabase\.com$/.test(url.hostname) || !m) {
   console.error('Usa la cadena del "Transaction pooler" (host *.pooler.supabase.com, usuario postgres.<ref>).');
   process.exit(1);

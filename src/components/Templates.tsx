@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Select from "@/components/Select";
 import * as Icon from "@/components/icons";
+import { textToHtml } from "@/lib/apply-template";
 
 type Channel = "email" | "whatsapp" | "ambos";
 interface Template {
@@ -25,7 +26,13 @@ const CHANNEL_LABEL: Record<Channel, string> = {
   whatsapp: "WhatsApp",
   ambos: "Correo + WhatsApp",
 };
-const VARS = ["{{nombre}}", "{{ciudad}}", "{{giro}}"];
+const VARS = ["{{nombre}}", "{{ciudad}}", "{{giro}}", "{{vendedor}}"];
+const VAR_HELP: Record<string, string> = {
+  "{{nombre}}": "Nombre del negocio",
+  "{{ciudad}}": "Ciudad de la búsqueda",
+  "{{giro}}": "Giro del negocio",
+  "{{vendedor}}": "Tu nombre (quien envía)",
+};
 
 // Plantilla base v1: mensaje que engancha, sirve para correo y WhatsApp.
 function starterV1() {
@@ -42,8 +49,20 @@ Nos encantaría ayudarles a captar más prospectos y cerrar más ventas, sin ded
 ¿Tendrían 15 minutos esta semana para mostrarles cómo?
 
 Saludos,
+{{vendedor}}
 AI Lead Shield`,
   };
+}
+
+// Lee las plantillas sin tocar estado (null si falló), para poder usarla en efectos.
+async function fetchTemplates(): Promise<Template[] | null> {
+  try {
+    const res = await fetch("/api/templates");
+    const data = await res.json();
+    return data.templates ?? [];
+  } catch {
+    return null;
+  }
 }
 
 export default function Templates() {
@@ -54,18 +73,16 @@ export default function Templates() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   async function load() {
-    try {
-      const res = await fetch("/api/templates");
-      const data = await res.json();
-      setTemplates(data.templates ?? []);
-    } catch {
-      /* ignora */
-    } finally {
-      setLoading(false);
-    }
+    const list = await fetchTemplates();
+    if (list) setTemplates(list);
+    setLoading(false);
   }
+  // Carga inicial: el setState va en el callback de la promesa, no en el efecto.
   useEffect(() => {
-    load();
+    fetchTemplates().then((list) => {
+      if (list) setTemplates(list);
+      setLoading(false);
+    });
   }, []);
 
   async function openHistory(t: Template) {
@@ -157,11 +174,7 @@ export default function Templates() {
                 </button>
                 <button
                   onClick={() => {
-                    const html = t.body
-                      .split("\n")
-                      .map((l) => (l.trim() ? `<p>${l}</p>` : "<br/>"))
-                      .join("");
-                    navigator.clipboard.writeText(html);
+                    navigator.clipboard.writeText(textToHtml(t.body));
                     setCopiedId(t.id);
                     setTimeout(() => setCopiedId(null), 1500);
                   }}
@@ -325,6 +338,7 @@ function Editor({
             {VARS.map((v) => (
               <button
                 key={v}
+                title={VAR_HELP[v]}
                 onClick={() => setBody((b) => b + v)}
                 className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-slate-200"
               >
@@ -337,8 +351,13 @@ function Editor({
           value={body}
           onChange={(e) => setBody(e.target.value)}
           rows={11}
-          className="mb-3 w-full rounded-xl border-0 bg-slate-50 px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+          className="mb-1 w-full rounded-xl border-0 bg-slate-50 px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-indigo-500"
         />
+        <p className="mb-3 text-[11px] text-slate-400">
+          Variables: <b>{"{{nombre}}"}</b> negocio · <b>{"{{ciudad}}"}</b> ciudad ·{" "}
+          <b>{"{{giro}}"}</b> giro · <b>{"{{vendedor}}"}</b> tu nombre (quien envía; úsalo
+          para firmar). La línea para darse de BAJA se agrega sola en los correos.
+        </p>
 
         {isEdit && (
           <input

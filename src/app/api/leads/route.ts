@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasDb } from "@/lib/db";
 import { listLeads, saveLead, clearLeads } from "@/lib/leads-repo";
-import type { Business } from "@/lib/types";
+import { isAdmin, sessionEmail } from "@/lib/session";
+import { LEAD_STATUSES } from "@/lib/types";
+import type { Business, LeadStatus, OwnerFilter } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -12,10 +14,28 @@ function noDb() {
   );
 }
 
-export async function GET() {
+const OWNERS: OwnerFilter[] = ["mine", "all", "unassigned"];
+
+// Lista paginada: ?q=&status=&owner=mine|all|unassigned&page=&pageSize=
+// pageSize=0 devuelve solo los conteos.
+export async function GET(req: NextRequest) {
   if (!hasDb()) return noDb();
   try {
-    return NextResponse.json({ leads: await listLeads() });
+    const me = await sessionEmail(req);
+    const p = req.nextUrl.searchParams;
+    const status = p.get("status") as LeadStatus | null;
+    const owner = p.get("owner") as OwnerFilter | null;
+    const page = Number(p.get("page") || 1);
+    const pageSize = p.has("pageSize") ? Number(p.get("pageSize")) : 30;
+    const data = await listLeads({
+      q: p.get("q") ?? "",
+      status: status && LEAD_STATUSES.includes(status) ? status : null,
+      owner: owner && OWNERS.includes(owner) ? owner : "mine",
+      me,
+      page: Number.isFinite(page) ? page : 1,
+      pageSize: Number.isFinite(pageSize) ? pageSize : 30,
+    });
+    return NextResponse.json(data);
   } catch (e) {
     console.error("leads GET", e);
     return NextResponse.json({ error: "Error leyendo prospectos." }, { status: 500 });
@@ -32,7 +52,8 @@ export async function POST(req: NextRequest) {
     if (!business?.id || !business?.name) {
       return NextResponse.json({ error: "Falta 'business'." }, { status: 400 });
     }
-    const lead = await saveLead(business, city);
+    // Quien lo guarda queda como dueño (si ya existía, se respeta el dueño previo).
+    const lead = await saveLead(business, city, await sessionEmail(req));
     return NextResponse.json({ lead });
   } catch (e) {
     console.error("leads POST", e);
@@ -40,8 +61,15 @@ export async function POST(req: NextRequest) {
   }
 }
 
-export async function DELETE() {
+// Vaciar TODOS los prospectos: solo administradores.
+export async function DELETE(req: NextRequest) {
   if (!hasDb()) return noDb();
+  if (!isAdmin(await sessionEmail(req))) {
+    return NextResponse.json(
+      { error: "Solo un administrador puede vaciar los prospectos." },
+      { status: 403 }
+    );
+  }
   try {
     await clearLeads();
     return NextResponse.json({ ok: true });

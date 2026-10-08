@@ -45,11 +45,14 @@ export default function LeadsMap({
     ? [points[0].lat, points[0].lon]
     : [23.6345, -102.5528]; // centro de México
 
-  // Sólo monta en cliente y con una key estable por instancia.
+  // Sólo monta en cliente y con una key fresca por montaje. La key se asigna
+  // en el siguiente frame (no síncrono dentro del efecto) para no provocar
+  // renders en cascada; en StrictMode el primer montaje se cancela solo.
   const [mapKey, setMapKey] = useState<number | null>(null);
   useEffect(() => {
-    setMapKey(++mountSeq);
+    const frame = requestAnimationFrame(() => setMapKey(++mountSeq));
     return () => {
+      cancelAnimationFrame(frame);
       // fuerza recreación limpia en el próximo montaje
       setMapKey(null);
     };

@@ -16,6 +16,8 @@ export default function Select({
   className = "",
   align = "left",
   compact = false,
+  disabled = false,
+  title,
 }: {
   value: string;
   options: SelectOption[];
@@ -23,6 +25,8 @@ export default function Select({
   className?: string;
   align?: "left" | "right";
   compact?: boolean;
+  disabled?: boolean;
+  title?: string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -44,11 +48,12 @@ export default function Select({
   }, []);
 
   return (
-    <div ref={ref} className={`relative ${className}`}>
+    <div ref={ref} className={`relative ${className}`} title={title}>
       <button
         type="button"
+        disabled={disabled}
         onClick={() => setOpen((v) => !v)}
-        className={`flex w-full items-center justify-between gap-2 rounded-xl text-left font-medium text-slate-700 outline-none transition focus:ring-2 focus:ring-indigo-500 ${
+        className={`flex w-full items-center justify-between gap-2 rounded-xl text-left font-medium text-slate-700 outline-none transition focus:ring-2 focus:ring-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 ${
           compact
             ? "border border-slate-200 bg-white px-3 py-1.5 text-xs hover:bg-slate-50"
             : "bg-slate-50 px-4 py-3 text-sm hover:bg-slate-100"
@@ -69,7 +74,7 @@ export default function Select({
         </svg>
       </button>
 
-      {open && (
+      {open && !disabled && (
         <ul
           className={`absolute z-30 mt-1 max-h-72 min-w-full overflow-auto rounded-xl border border-slate-200 bg-white p-1 shadow-lg animate-[fadeIn_0.15s_ease] ${
             align === "right" ? "right-0" : "left-0"

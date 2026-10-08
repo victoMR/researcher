@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifySession, SESSION_COOKIE } from "@/lib/auth";
 
+// Proxy (antes "middleware"; renombrado en Next 16). Corre en runtime Node.js.
+
 // Rutas públicas (no requieren sesión).
 const PUBLIC = ["/login", "/api/auth/"];
 
-export async function middleware(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
   if (PUBLIC.some((p) => pathname === p || pathname.startsWith(p))) {

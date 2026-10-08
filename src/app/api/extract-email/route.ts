@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { checkPublicUrl, safeFetchText } from "@/lib/safe-fetch";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -88,25 +89,6 @@ function normalizeUrl(url: string): string {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`;
 }
 
-async function fetchText(url: string, signal: AbortSignal): Promise<string> {
-  try {
-    const res = await fetch(url, {
-      signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; Prospector/1.0; lead research)",
-        Accept: "text/html,*/*",
-      },
-      redirect: "follow",
-    });
-    if (!res.ok) return "";
-    const type = res.headers.get("content-type") || "";
-    if (!type.includes("text/html") && !type.includes("text/plain")) return "";
-    return await res.text();
-  } catch {
-    return "";
-  }
-}
-
 // Correos que NUNCA sirven como contacto comercial -> se EXCLUYEN por completo
 // (privacidad/legal/ARCO/automáticos). Mejor no mostrar nada que mostrar esto.
 const EXCLUDE_ROLE =
@@ -142,20 +124,23 @@ function rankEmails(emails: string[], siteHost: string): string[] {
 
 export async function POST(req: NextRequest) {
   try {
-    const { website } = (await req.json()) as { website?: string };
-    if (!website) {
+    const { website } = (await req.json()) as { website?: unknown };
+    if (!website || typeof website !== "string") {
       return NextResponse.json({ error: "Falta 'website'." }, { status: 400 });
     }
 
     const base = normalizeUrl(website.trim());
-    let origin: string;
+    // Anti-SSRF: solo URLs públicas (http/https, sin hosts ni IPs internas).
+    // Si el dominio solo no resuelve, se sigue como antes (respuesta vacía).
+    const check = await checkPublicUrl(base);
+    if (!check.ok && check.reason !== "dns") {
+      return NextResponse.json({ error: "URL no permitida." }, { status: 400 });
+    }
     let host: string;
     try {
-      const u = new URL(base);
-      origin = u.origin;
-      host = u.hostname;
+      host = new URL(base).hostname;
     } catch {
-      return NextResponse.json({ error: "URL inválida." }, { status: 400 });
+      return NextResponse.json({ error: "URL no permitida." }, { status: 400 });
     }
 
     const controller = new AbortController();
@@ -189,7 +174,7 @@ export async function POST(req: NextRequest) {
           ];
       for (const url of pages) {
         if (emails.size >= 8) break;
-        const html = await fetchText(url, controller.signal);
+        const html = await safeFetchText(url, controller.signal);
         if (!html) continue;
         extractEmails(html).forEach((e) => emails.add(e));
         extractSocials(html).forEach((s) => socials.add(s));

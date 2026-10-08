@@ -1,18 +1,23 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import dynamic from "next/dynamic";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Template } from "@/lib/templates-repo";
 import { CATEGORIES, getCategory } from "@/lib/categories";
-import type { Business, Lead, LeadStatus } from "@/lib/types";
-import { useLeads } from "@/lib/useLeads";
-import { waLink } from "@/lib/wa";
-import { applyVars } from "@/lib/apply-template";
+import type { Business, LeadMatch, Me, SearchResponse } from "@/lib/types";
+import { useSavedMatches } from "@/lib/useLeads";
+import { downloadCSV, isRecent, shortDate, timeAgo } from "@/lib/format";
 import ComposeModal from "@/components/ComposeModal";
 import StatusTicker from "@/components/StatusTicker";
 import Select from "@/components/Select";
 import Dashboard from "@/components/Dashboard";
 import Templates from "@/components/Templates";
+import BusinessCard from "@/components/BusinessCard";
+import MapView from "@/components/MapView";
+import Prospects, {
+  DEFAULT_PROSPECT_FILTERS,
+  type ProspectFilters,
+} from "@/components/Prospects";
+import { EmptyState, Segmented, SkeletonCard } from "@/components/ui";
 import * as Icon from "@/components/icons";
 
 const CAT_ICON: Record<string, React.ReactNode> = {
@@ -21,13 +26,6 @@ const CAT_ICON: Record<string, React.ReactNode> = {
   inmobiliarias: <Icon.Building className="h-4 w-4 text-slate-500" />,
   talleres: <Icon.Wrench className="h-4 w-4 text-slate-500" />,
 };
-
-// Un negocio es "activo" si su reseña más reciente es de los últimos 6 meses.
-const ACTIVE_WINDOW_MS = 1000 * 60 * 60 * 24 * 180;
-function isRecent(iso?: string): boolean {
-  if (!iso) return false;
-  return Date.now() - Date.parse(iso) <= ACTIVE_WINDOW_MS;
-}
 
 const SORT_OPTIONS = [
   { value: "score", label: "Mejor prospecto" },
@@ -56,21 +54,6 @@ function scoreLead(b: Business, hasSocial: boolean): number {
   return Math.max(1, Math.min(10, Math.round(s)));
 }
 
-// Mensaje de WhatsApp: usa la plantilla elegida (con variables) o uno por defecto.
-function buildWaText(
-  lead: Pick<Business, "name" | "city" | "category">,
-  templateBody?: string
-): string {
-  if (templateBody) return applyVars(templateBody, lead);
-  return `Hola, equipo de ${lead.name}. Le escribo de AI Lead Shield: ayudamos a negocios como el suyo a conseguir más clientes con automatización e inteligencia artificial. ¿Tendrían 15 min esta semana para mostrarles cómo?`;
-}
-
-function scoreColor(score: number): string {
-  if (score >= 8) return "bg-emerald-100 text-emerald-700";
-  if (score >= 5) return "bg-amber-100 text-amber-700";
-  return "bg-slate-100 text-slate-500";
-}
-
 // Distancia en km entre dos coordenadas (haversine).
 function distanceKm(
   lat1: number,
@@ -89,24 +72,26 @@ function distanceKm(
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-const LeadsMap = dynamic(() => import("@/components/LeadsMap"), {
-  ssr: false,
-  loading: () => (
-    <div className="flex h-full items-center justify-center text-sm text-slate-400">
-      Cargando mapa…
-    </div>
-  ),
-});
-
 type Tab = "buscar" | "prospectos" | "plantillas" | "metricas";
 type View = "lista" | "mapa";
+type SearchMode = "google" | "general";
 
-const STATUS_META: Record<LeadStatus, { label: string; cls: string }> = {
-  nuevo: { label: "Nuevo", cls: "bg-slate-100 text-slate-600" },
-  contactado: { label: "Contactado", cls: "bg-indigo-100 text-indigo-700" },
-  respondio: { label: "Respondió", cls: "bg-emerald-100 text-emerald-700" },
-  descartado: { label: "Descartado", cls: "bg-rose-100 text-rose-700" },
-};
+// Última búsqueda mostrada (para "Cargar más" y "Actualizar").
+interface SearchQuery {
+  city: string;
+  category: string;
+  mode: SearchMode;
+}
+
+function searchBody(qy: SearchQuery, extra: { refresh?: boolean; pageToken?: string } = {}) {
+  return JSON.stringify({
+    city: qy.city,
+    category: qy.category,
+    source: qy.mode === "general" ? "osm" : undefined,
+    global: qy.mode === "general",
+    ...extra,
+  });
+}
 
 export default function Home() {
   const [tab, setTab] = useState<Tab>("buscar");
@@ -125,10 +110,31 @@ export default function Home() {
   const [socials, setSocials] = useState<Record<string, string[]>>({});
   const [guesses, setGuesses] = useState<Record<string, string[]>>({});
   const [autoProgress, setAutoProgress] = useState<{ done: number; total: number } | null>(null);
-  const [mode, setMode] = useState<"google" | "general">("google");
+  const [mode, setMode] = useState<SearchMode>("google");
   const [userCoords, setUserCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [locating, setLocating] = useState(false);
   const [templates, setTemplates] = useState<Template[]>([]);
+  const [me, setMe] = useState<Me | null>(null);
+  // Paginación / caché de la búsqueda (opcionales según la respuesta).
+  const [lastQuery, setLastQuery] = useState<SearchQuery | null>(null);
+  const [nextPageToken, setNextPageToken] = useState<string | null>(null);
+  const [cacheInfo, setCacheInfo] = useState<{ cachedAt?: string } | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Pestaña Prospectos: filtros (sobreviven al cambiar de pestaña) y recarga.
+  const [prospectFilters, setProspectFilters] =
+    useState<ProspectFilters>(DEFAULT_PROSPECT_FILTERS);
+  const [prospectsKey, setProspectsKey] = useState(0);
+
+  // Quién está logueado (para dueño, permisos y {{vendedor}}).
+  useEffect(() => {
+    fetch("/api/auth/me")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: Me | null) => {
+        if (d?.email) setMe(d);
+      })
+      .catch(() => {});
+  }, []);
 
   // Carga plantillas (para usarlas en WhatsApp y en la propuesta). Se refresca
   // al volver a Buscar/Prospectos por si creaste plantillas nuevas.
@@ -146,86 +152,121 @@ export default function Home() {
     [templates]
   );
 
-  const { leads, ready, isSaved, addLead, removeLead, updateLead, clearAll } =
-    useLeads();
+  const { matchFor, check, addLead, claim, updateSaved, mineCount, refreshCount } =
+    useSavedMatches(me?.email);
+
+  // La extracción automática corre en segundo plano: usa siempre las
+  // coincidencias más recientes (llegan después de iniciar).
+  const matchRef = useRef(matchFor);
+  useEffect(() => {
+    matchRef.current = matchFor;
+  }, [matchFor]);
+
+  // ¿Puedo modificar este prospecto guardado?
+  const canTouch = (m: LeadMatch) =>
+    !m.ownerEmail || m.ownerEmail === me?.email || !!me?.isAdmin;
 
   const catLabel = getCategory(category)?.label ?? "";
 
   async function logout() {
     await fetch("/api/auth/logout", { method: "POST" });
+    // Recarga completa a propósito: no queda nada del vendedor en memoria.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.href = "/login";
   }
 
-  const [ghlBusy, setGhlBusy] = useState(false);
-  async function pushToGhl(list: Lead[]) {
-    if (!list.length) return;
-    setGhlBusy(true);
-    try {
-      const res = await fetch("/api/ghl/contacts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ leads: list }),
-      });
-      const d = await res.json();
-      if (!res.ok) {
-        alert(d.error || "No se pudo enviar a GHL.");
-      } else {
-        alert(
-          `GHL: ${d.pushed} contacto(s) enviados` +
-            (d.skipped ? `, ${d.skipped} sin correo/teléfono` : "") +
-            (d.failed ? `, ${d.failed} con error` : "") +
-            "."
-        );
-      }
-    } catch {
-      alert("Error de red al enviar a GHL.");
-    } finally {
-      setGhlBusy(false);
-    }
+  // Algo cambió en los prospectos: contador, tarjetas de resultados y lista.
+  function refreshSaved({ list = true }: { list?: boolean } = {}) {
+    refreshCount();
+    if (results.length) check(results, "refresh");
+    if (list) setProspectsKey((k) => k + 1);
   }
 
   async function search(e?: React.FormEvent, cityArg?: string) {
     e?.preventDefault();
     const q = (cityArg ?? city).trim();
     if (!q) return;
+    await runSearch({ city: q, category, mode });
+  }
+
+  async function runSearch(qy: SearchQuery, opts: { refresh?: boolean } = {}) {
     setLoading(true);
     setError(null);
+    setNotice(null);
     setResults([]);
-    setSearchedCity(q);
+    setSearchedCity(qy.city);
+    setNextPageToken(null);
+    setCacheInfo(null);
     try {
       const res = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          city: q,
-          category,
-          source: mode === "general" ? "osm" : undefined,
-          global: mode === "general",
-        }),
+        body: searchBody(qy, opts.refresh ? { refresh: true } : {}),
       });
-      const data = await res.json();
+      const data = (await res.json()) as SearchResponse & { error?: string };
       if (!res.ok) {
         setError(data.error || "Error en la búsqueda.");
       } else {
         // Marca la ciudad buscada en cada resultado (para dedupe y guardado).
-        const withCity = (data.results as Business[]).map((r) => ({
-          ...r,
-          city: q,
-        }));
+        const withCity = (data.results ?? []).map((r) => ({ ...r, city: qy.city }));
         setResults(withCity);
         setSource(data.source || null);
         setSocials({});
         setGuesses({});
-        if (!withCity.length)
+        setLastQuery(qy);
+        setNextPageToken(data.nextPageToken || null);
+        setCacheInfo(data.cached ? { cachedAt: data.cachedAt } : null);
+        setNotice(data.notice || null);
+        if (!withCity.length) {
+          const label = getCategory(qy.category)?.label ?? "negocios";
           setError(
-            `No encontré ${catLabel.toLowerCase()} en ${q}. Prueba otra ciudad o giro.`
+            `No encontré ${label.toLowerCase()} en ${qy.city}. Prueba otra ciudad o giro.`
           );
-        else autoExtract(withCity);
+        } else {
+          check(withCity, "reset");
+          autoExtract(withCity);
+        }
       }
     } catch {
       setError("Error de red. Intenta de nuevo.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  // Siguiente página de la misma búsqueda (misma ciudad/giro/modo).
+  async function loadMore() {
+    if (!lastQuery || !nextPageToken || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const res = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: searchBody(lastQuery, { pageToken: nextPageToken }),
+      });
+      const data = (await res.json()) as SearchResponse & { error?: string };
+      if (!res.ok) {
+        setError(data.error || "No se pudieron cargar más resultados.");
+        return;
+      }
+      const seen = new Set(results.map((r) => r.id));
+      const fresh = (data.results ?? [])
+        .map((r) => ({ ...r, city: lastQuery.city }))
+        .filter((r) => !seen.has(r.id) && seen.add(r.id));
+      setResults((rs) => {
+        const ids = new Set(rs.map((r) => r.id));
+        return [...rs, ...fresh.filter((r) => !ids.has(r.id))];
+      });
+      setNextPageToken(data.nextPageToken || null);
+      if (data.notice) setNotice(data.notice);
+      if (fresh.length) {
+        check(fresh, "merge");
+        autoExtract(fresh);
+      }
+    } catch {
+      setError("Error de red al cargar más resultados.");
+    } finally {
+      setLoadingMore(false);
     }
   }
 
@@ -247,7 +288,9 @@ export default function Home() {
       setResults((rs) =>
         rs.map((r) => (r.id === b.id ? { ...r, email: email ?? "" } : r))
       );
-      if (email && isSaved(b)) updateLead(b.id, { email });
+      // Si ya estaba guardado (y es mío o sin dueño), guarda el correo.
+      const m = matchRef.current(b);
+      if (email && m && canTouch(m)) updateSaved(b, m, { email });
     } catch {
       /* ignora */
     } finally {
@@ -265,7 +308,7 @@ export default function Home() {
     // Si abriste por la IP de red (192.168.x), el permiso ni aparece.
     if (!window.isSecureContext) {
       setError(
-        `La ubicación solo funciona en un sitio seguro. Abre la app en http://localhost:3002 (no por la IP de red ${location.hostname}), o despliégala con HTTPS.`
+        `La ubicación solo funciona en un sitio seguro (HTTPS o localhost). Abriste la app por ${location.hostname}: entra por localhost en esta computadora o usa la versión publicada con HTTPS.`
       );
       return;
     }
@@ -307,7 +350,20 @@ export default function Home() {
   // Elige un correo sugerido (dominio de la matriz) como el correo del negocio.
   function pickEmail(b: Business, email: string) {
     setResults((rs) => rs.map((r) => (r.id === b.id ? { ...r, email } : r)));
-    if (isSaved(b)) updateLead(b.id, { email });
+    const m = matchFor(b);
+    if (m && canTouch(m)) updateSaved(b, m, { email });
+  }
+
+  async function saveResult(b: Business) {
+    const err = await addLead(b);
+    if (err) alert(err);
+    else setProspectsKey((k) => k + 1);
+  }
+
+  async function claimResult(b: Business, m: LeadMatch) {
+    const err = await claim(b, m);
+    if (err) alert(err);
+    else setProspectsKey((k) => k + 1);
   }
 
   // Saca correos de todos los negocios con web, varios en paralelo, con progreso.
@@ -331,31 +387,22 @@ export default function Home() {
     setAutoProgress(null);
   }
 
-  function exportCSV(rows: Business[]) {
-    const header = ["Score", "Nombre", "Giro", "Correo", "Teléfono", "Web", "Rating", "Reseñas", "Dirección"];
-    const lines = rows.map((r) =>
-      [
-        r.score ?? "",
+  function exportResultsCSV(rows: Business[]) {
+    downloadCSV(
+      "negocios.csv",
+      ["Score", "Nombre", "Giro", "Correo", "Teléfono", "Web", "Rating", "Reseñas", "Dirección"],
+      rows.map((r) => [
+        r.score,
         r.name,
         r.category,
-        r.email || "",
-        r.phone || "",
-        r.website || "",
-        r.rating ?? "",
-        r.reviewCount ?? "",
-        r.address || "",
-      ]
-        .map((v) => `"${String(v).replace(/"/g, '""')}"`)
-        .join(",")
+        r.email,
+        r.phone,
+        r.website,
+        r.rating,
+        r.reviewCount,
+        r.address,
+      ])
     );
-    const csv = [header.join(","), ...lines].join("\n");
-    const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "prospectos.csv";
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   // Resultados con score + distancia (si hay ubicación) + filtro + orden.
@@ -404,11 +451,9 @@ export default function Home() {
     [results]
   );
 
-  const rows =
-    tab === "buscar" ? filteredResults : tab === "prospectos" ? leads : [];
-  const showResults =
-    (tab === "buscar" || tab === "prospectos") && rows.length > 0;
-  const mapPoints = tab === "buscar" ? filteredResults : (leads as Business[]);
+  const isSearch = tab === "buscar";
+  const hasResults = isSearch && results.length > 0; // hay búsqueda (aunque el filtro oculte todo)
+  const showResults = isSearch && filteredResults.length > 0;
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -423,7 +468,9 @@ export default function Home() {
               <h1 className="text-base font-semibold leading-tight tracking-tight text-slate-900">
                 AI Lead Shield
               </h1>
-              <p className="text-xs text-slate-400">Prospección de clientes</p>
+              <p className="text-xs text-slate-400">
+                {me ? `Hola, ${me.name.split(" ")[0]}` : "Prospección de clientes"}
+              </p>
             </div>
           </div>
           <nav className="flex gap-1 rounded-full bg-black/[0.04] p-1">
@@ -437,8 +484,8 @@ export default function Home() {
                     : "text-slate-500 hover:text-slate-800"
                 }`}
               >
-                {t === "prospectos" && ready && leads.length > 0
-                  ? `Prospectos (${leads.length})`
+                {t === "prospectos" && mineCount
+                  ? `Prospectos (${mineCount})`
                   : t === "metricas"
                     ? "Métricas"
                     : t}
@@ -446,7 +493,7 @@ export default function Home() {
             ))}
             <button
               onClick={logout}
-              title="Cerrar sesión"
+              title={me ? `Cerrar sesión (${me.email})` : "Cerrar sesión"}
               className="ml-1 grid h-8 w-8 place-items-center rounded-full text-slate-400 transition hover:bg-black/[0.04] hover:text-slate-700"
             >
               <Icon.LogOut className="h-4 w-4" />
@@ -458,8 +505,19 @@ export default function Home() {
       <main className="mx-auto max-w-6xl px-4 py-8">
         {tab === "metricas" && <Dashboard />}
         {tab === "plantillas" && <Templates />}
+        {tab === "prospectos" && (
+          <Prospects
+            me={me}
+            filters={prospectFilters}
+            setFilters={setProspectFilters}
+            refreshKey={prospectsKey}
+            waTemplateBody={waTemplateBody}
+            onCompose={(l) => setCompose(l)}
+            onChanged={() => refreshSaved({ list: false })}
+          />
+        )}
 
-        {tab === "buscar" && (
+        {isSearch && (
           <section className="mx-auto mb-8 max-w-3xl text-center">
             <h2 className="text-4xl font-semibold tracking-[-0.03em] text-slate-900 sm:text-5xl">
               Encuentra clientes potenciales
@@ -516,28 +574,28 @@ export default function Home() {
             {/* Selector de modo de búsqueda */}
             <div className="mt-3 flex items-center justify-center gap-2 text-xs">
               <span className="text-slate-400">Modo:</span>
-              <div className="flex rounded-full bg-black/[0.04] p-0.5">
-                <button
-                  onClick={() => setMode("google")}
-                  className={`flex items-center gap-1.5 rounded-full px-3 py-1 font-medium transition ${
-                    mode === "google"
-                      ? "bg-white text-slate-900 shadow-apple-sm"
-                      : "text-slate-500"
-                  }`}
-                >
-                  <Icon.Target className="h-3.5 w-3.5" /> México (Google)
-                </button>
-                <button
-                  onClick={() => setMode("general")}
-                  className={`flex items-center gap-1.5 rounded-full px-3 py-1 font-medium transition ${
-                    mode === "general"
-                      ? "bg-white text-slate-900 shadow-apple-sm"
-                      : "text-slate-500"
-                  }`}
-                >
-                  <Icon.Globe className="h-3.5 w-3.5" /> General · mundial (gratis)
-                </button>
-              </div>
+              <Segmented<SearchMode>
+                value={mode}
+                onChange={setMode}
+                options={[
+                  {
+                    value: "google",
+                    label: (
+                      <>
+                        <Icon.Target className="h-3.5 w-3.5" /> México (Google)
+                      </>
+                    ),
+                  },
+                  {
+                    value: "general",
+                    label: (
+                      <>
+                        <Icon.Globe className="h-3.5 w-3.5" /> General · mundial (gratis)
+                      </>
+                    ),
+                  },
+                ]}
+              />
             </div>
             <p className="mt-1 text-center text-xs text-slate-400">
               {mode === "google"
@@ -548,7 +606,7 @@ export default function Home() {
         )}
 
         {/* Barra de resultados */}
-        {(showResults || loading) && (
+        {isSearch && (hasResults || loading) && (
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-3">
               {loading ? (
@@ -561,11 +619,31 @@ export default function Home() {
                   ]}
                 />
               ) : (
-                <span className="flex items-center text-sm font-medium text-slate-600">
-                  {rows.length} {tab === "buscar" ? "negocios" : "prospectos"}
-                  {tab === "buscar" && source && (
+                <span className="flex flex-wrap items-center gap-y-1 text-sm font-medium text-slate-600">
+                  {filteredResults.length} negocios
+                  {source && (
                     <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">
                       {source === "google" ? "Google" : "OSM (gratis)"}
+                    </span>
+                  )}
+                  {cacheInfo && (
+                    <span
+                      className="ml-2 flex items-center gap-1 rounded-full bg-slate-100 py-0.5 pl-2 pr-0.5 text-xs text-slate-500"
+                      title={
+                        cacheInfo.cachedAt
+                          ? `Resultados guardados el ${shortDate(cacheInfo.cachedAt)}: no gastaron cuota.`
+                          : "Resultados guardados: no gastaron cuota."
+                      }
+                    >
+                      <Icon.Clock className="h-3 w-3" />
+                      En caché{cacheInfo.cachedAt ? ` · ${timeAgo(cacheInfo.cachedAt)}` : ""}
+                      <button
+                        onClick={() => lastQuery && runSearch(lastQuery, { refresh: true })}
+                        title="Volver a consultar la fuente (puede gastar cuota)"
+                        className="ml-0.5 flex items-center gap-1 rounded-full bg-white px-1.5 py-0.5 font-medium text-indigo-600 shadow-apple-sm hover:bg-indigo-50"
+                      >
+                        <Icon.Refresh className="h-3 w-3" /> Actualizar
+                      </button>
                     </span>
                   )}
                   {autoProgress && (
@@ -577,9 +655,9 @@ export default function Home() {
                 </span>
               )}
             </div>
-            {showResults && (
+            {hasResults && !loading && (
               <div className="flex flex-wrap items-center gap-2">
-                {tab === "buscar" && hasActivityData && (
+                {hasActivityData && (
                   <>
                     <button
                       onClick={() => setOnlyActive((v) => !v)}
@@ -602,57 +680,41 @@ export default function Home() {
                     />
                   </>
                 )}
-                <div className="flex rounded-full bg-black/[0.04] p-0.5">
-                  {(["lista", "mapa"] as View[]).map((v) => (
-                    <button
-                      key={v}
-                      onClick={() => setView(v)}
-                      className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium capitalize transition ${
-                        view === v
-                          ? "bg-white text-slate-900 shadow-apple-sm"
-                          : "text-slate-500"
-                      }`}
-                    >
-                      {v === "lista" ? (
-                        <Icon.List className="h-3.5 w-3.5" />
-                      ) : (
-                        <Icon.MapIcon className="h-3.5 w-3.5" />
-                      )}
-                      {v === "lista" ? "Lista" : "Mapa"}
-                    </button>
-                  ))}
-                </div>
+                <Segmented<View>
+                  value={view}
+                  onChange={setView}
+                  options={[
+                    {
+                      value: "lista",
+                      label: (
+                        <>
+                          <Icon.List className="h-3.5 w-3.5" /> Lista
+                        </>
+                      ),
+                    },
+                    {
+                      value: "mapa",
+                      label: (
+                        <>
+                          <Icon.MapIcon className="h-3.5 w-3.5" /> Mapa
+                        </>
+                      ),
+                    },
+                  ]}
+                />
                 <button
-                  onClick={() => exportCSV(rows)}
+                  onClick={() => exportResultsCSV(filteredResults)}
                   className="flex items-center gap-1.5 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
                 >
                   <Icon.Download className="h-3.5 w-3.5" /> CSV
                 </button>
-                {tab === "prospectos" && (
-                  <button
-                    onClick={() => pushToGhl(leads)}
-                    disabled={ghlBusy}
-                    className="flex items-center gap-1.5 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-                  >
-                    <Icon.Send className="h-3.5 w-3.5" />
-                    {ghlBusy ? "Enviando…" : "Enviar a GHL"}
-                  </button>
-                )}
-                {tab === "prospectos" && (
-                  <button
-                    onClick={() => confirm("¿Borrar todos los prospectos?") && clearAll()}
-                    className="rounded-full border border-rose-200 bg-white px-3 py-1.5 text-xs font-medium text-rose-600 hover:bg-rose-50"
-                  >
-                    Vaciar
-                  </button>
-                )}
               </div>
             )}
           </div>
         )}
 
         {/* Aviso modo gratis */}
-        {tab === "buscar" && !loading && source === "osm" && mode === "google" && (
+        {isSearch && !loading && source === "osm" && mode === "google" && (
           <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
             Estás en <b>modo gratis (OSM)</b>: bueno para agencias de autos, pero
             casi sin datos de seminuevos e inmobiliarias. Agrega tu key de Google
@@ -660,14 +722,21 @@ export default function Home() {
           </p>
         )}
 
-        {error && !loading && (
+        {/* Aviso de la búsqueda (p. ej. tope de gasto o datos parciales) */}
+        {isSearch && notice && !loading && (
+          <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            {notice}
+          </p>
+        )}
+
+        {isSearch && error && !loading && (
           <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
             {error}
           </p>
         )}
 
         {/* Loading skeleton */}
-        {loading && (
+        {isSearch && loading && (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 6 }).map((_, i) => (
               <SkeletonCard key={i} />
@@ -678,56 +747,67 @@ export default function Home() {
         {/* Contenido */}
         {!loading && showResults && view === "mapa" && (
           <div className="h-[70vh] overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
-            <LeadsMap points={mapPoints} />
+            <MapView points={filteredResults} />
           </div>
         )}
 
         {!loading && showResults && view === "lista" && (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {tab === "buscar"
-              ? filteredResults.map((b) => (
-                  <BusinessCard
-                    key={b.id}
-                    b={b}
-                    city={searchedCity}
-                    socials={socials[b.id]}
-                    guesses={guesses[b.id]}
-                    waTemplateBody={waTemplateBody}
-                    saved={isSaved(b)}
-                    extracting={!!extracting[b.id]}
-                    onSave={() => addLead(b)}
-                    onExtract={() => extractEmail(b)}
-                    onCompose={() => setCompose(b)}
-                    onPickEmail={(e) => pickEmail(b, e)}
-                  />
-                ))
-              : (leads as Lead[]).map((l) => (
-                  <LeadCard
-                    key={l.id}
-                    l={l}
-                    waTemplateBody={waTemplateBody}
-                    onStatus={(s) => updateLead(l.id, { status: s })}
-                    onRemove={() => removeLead(l.id)}
-                    onCompose={() => setCompose(l)}
-                    onGhl={() => pushToGhl([l])}
-                  />
-                ))}
+            {filteredResults.map((b) => {
+              const m = matchFor(b);
+              return (
+                <BusinessCard
+                  key={b.id}
+                  b={b}
+                  city={searchedCity}
+                  socials={socials[b.id]}
+                  guesses={guesses[b.id]}
+                  waTemplateBody={waTemplateBody}
+                  me={me}
+                  match={m}
+                  extracting={!!extracting[b.id]}
+                  onSave={() => saveResult(b)}
+                  onClaim={() => m && claimResult(b, m)}
+                  onExtract={() => extractEmail(b)}
+                  onCompose={() => setCompose(b)}
+                  onPickEmail={(e) => pickEmail(b, e)}
+                />
+              );
+            })}
           </div>
         )}
 
-        {/* Estados vacíos */}
-        {!loading && !showResults && !error && tab === "buscar" && (
+        {/* Más resultados (siguiente página de la fuente) */}
+        {isSearch && !loading && results.length > 0 && nextPageToken && (
+          <div className="mt-6 flex justify-center">
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="flex items-center gap-1.5 rounded-full border border-black/10 bg-white px-5 py-2 text-sm font-medium text-slate-700 shadow-apple-sm transition hover:bg-slate-50 disabled:opacity-60"
+            >
+              {loadingMore ? (
+                <>
+                  <Icon.Loader className="h-4 w-4" /> Cargando…
+                </>
+              ) : (
+                <>
+                  <Icon.Plus className="h-4 w-4" /> Cargar más resultados
+                </>
+              )}
+            </button>
+          </div>
+        )}
+
+        {/* Estado vacío */}
+        {isSearch && !loading && !showResults && !error && (
           <EmptyState
             icon={<Icon.Search className="h-8 w-8" />}
-            title="Empieza una búsqueda"
-            sub="Elige un giro y una ciudad para encontrar negocios."
-          />
-        )}
-        {!loading && !showResults && tab === "prospectos" && (
-          <EmptyState
-            icon={<Icon.Bookmark className="h-8 w-8" />}
-            title="Aún no guardas prospectos"
-            sub="Búscalos y dale “Guardar” para armar tu lista."
+            title={results.length ? "Ningún negocio activo" : "Empieza una búsqueda"}
+            sub={
+              results.length
+                ? "Quita el filtro “Solo activos” para ver todos."
+                : "Elige un giro y una ciudad para encontrar negocios."
+            }
           />
         )}
       </main>
@@ -736,350 +816,9 @@ export default function Home() {
         <ComposeModal
           lead={compose}
           onClose={() => setCompose(null)}
-          onSent={() =>
-            isSaved(compose) && updateLead(compose.id, { status: "contactado" })
-          }
+          onSent={() => refreshSaved()}
         />
       )}
     </div>
-  );
-}
-
-/* ---------- Subcomponentes ---------- */
-
-function SkeletonCard() {
-  return (
-    <div className="relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-4">
-      <div className="absolute inset-0 -translate-x-full animate-[shimmer_1.5s_infinite] bg-gradient-to-r from-transparent via-slate-100 to-transparent" />
-      <div className="mb-3 h-4 w-2/3 rounded bg-slate-100" />
-      <div className="mb-2 h-3 w-full rounded bg-slate-100" />
-      <div className="mb-4 h-3 w-1/2 rounded bg-slate-100" />
-      <div className="flex gap-2">
-        <div className="h-7 w-20 rounded-lg bg-slate-100" />
-        <div className="h-7 w-20 rounded-lg bg-slate-100" />
-      </div>
-    </div>
-  );
-}
-
-function EmptyState({
-  icon,
-  title,
-  sub,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  sub: string;
-}) {
-  return (
-    <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-black/10 bg-white py-16 text-center">
-      <span className="mb-3 text-slate-300">{icon}</span>
-      <h3 className="font-semibold text-slate-700">{title}</h3>
-      <p className="mt-1 text-sm text-slate-400">{sub}</p>
-    </div>
-  );
-}
-
-function CardShell({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex flex-col rounded-2xl border border-black/5 bg-white p-4 shadow-apple-sm transition hover:shadow-apple animate-[fadeIn_0.3s_ease]">
-      {children}
-    </div>
-  );
-}
-
-function BusinessCard({
-  b,
-  city,
-  socials,
-  guesses,
-  waTemplateBody,
-  saved,
-  extracting,
-  onSave,
-  onExtract,
-  onCompose,
-  onPickEmail,
-}: {
-  b: Business;
-  city: string;
-  socials?: string[];
-  guesses?: string[];
-  waTemplateBody?: string;
-  saved: boolean;
-  extracting: boolean;
-  onSave: () => void;
-  onExtract: () => void;
-  onCompose: () => void;
-  onPickEmail: (email: string) => void;
-}) {
-  const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(
-    `"${b.name}" ${city} correo OR contacto OR email`
-  )}`;
-  const wa = b.phone ? waLink(b.phone, buildWaText(b, waTemplateBody)) : null;
-  const recent = isRecent(b.lastReviewTime);
-  return (
-    <CardShell>
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
-          {b.score != null && (
-            <span
-              className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg text-sm font-bold ${scoreColor(b.score)}`}
-              title="Calificación de prospecto (1–10): calidad de reseñas, actividad reciente y facilidad de contacto"
-            >
-              {b.score}
-            </span>
-          )}
-          <h3 className="truncate font-semibold text-slate-900" title={b.name}>
-            {b.name}
-          </h3>
-        </div>
-        {b.lastReviewAgo && (
-          <span
-            className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${
-              recent
-                ? "bg-emerald-100 text-emerald-700"
-                : "bg-slate-100 text-slate-500"
-            }`}
-            title={`Reseña más reciente: ${b.lastReviewAgo}`}
-          >
-            {recent && <Icon.Flame className="h-3 w-3" />}
-            {b.lastReviewAgo}
-          </span>
-        )}
-      </div>
-      {(b.rating != null || b.reviewCount != null) && (
-        <div className="mt-1 flex items-center gap-1 text-xs text-slate-500">
-          <Icon.Star className="h-3.5 w-3.5 text-amber-500" />
-          <span className="font-medium text-slate-700">
-            {b.rating?.toFixed(1) ?? "—"}
-          </span>
-          {b.reviewCount != null && <span>({b.reviewCount} reseñas)</span>}
-        </div>
-      )}
-      {b.address && (
-        <p className="mt-0.5 line-clamp-2 text-xs text-slate-400">{b.address}</p>
-      )}
-      <div className="mt-2 flex flex-1 flex-col gap-1 text-xs text-slate-600">
-        {b.distanceKm != null && (
-          <span className="flex items-center gap-1.5 font-medium text-slate-500">
-            <Icon.MapPin className="h-3.5 w-3.5" />a{" "}
-            {b.distanceKm < 1
-              ? `${Math.round(b.distanceKm * 1000)} m`
-              : `${b.distanceKm.toFixed(1)} km`}{" "}
-            de ti
-          </span>
-        )}
-        {b.phone && (
-          <span className="flex items-center gap-1.5">
-            <Icon.Phone className="h-3.5 w-3.5 text-slate-400" />
-            {b.phone}
-          </span>
-        )}
-        {b.website && (
-          <a
-            href={b.website}
-            target="_blank"
-            rel="noreferrer"
-            className="flex items-center gap-1.5 truncate text-indigo-600 hover:underline"
-          >
-            <Icon.Globe className="h-3.5 w-3.5 shrink-0" />
-            <span className="truncate">{b.website.replace(/^https?:\/\//, "")}</span>
-          </a>
-        )}
-        {b.email ? (
-          <span className="flex items-center gap-1.5 font-medium text-emerald-600">
-            <Icon.Mail className="h-3.5 w-3.5" />
-            {b.email}
-          </span>
-        ) : extracting ? (
-          <span className="flex items-center gap-1.5 text-slate-400">
-            <span className="h-1.5 w-1.5 animate-ping rounded-full bg-indigo-400" />
-            buscando correo…
-          </span>
-        ) : b.email === "" ? (
-          <div className="flex flex-wrap items-center gap-2 text-slate-400">
-            <span>sin correo directo</span>
-            <a
-              href={googleUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1 rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-slate-200"
-            >
-              <Icon.Search className="h-3 w-3" /> Google
-            </a>
-            {socials?.map((s) => (
-              <a
-                key={s}
-                href={s}
-                target="_blank"
-                rel="noreferrer"
-                className="flex items-center gap-1 rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-slate-200"
-              >
-                <Icon.ExternalLink className="h-3 w-3" />
-                {s.includes("facebook")
-                  ? "Facebook"
-                  : s.includes("instagram")
-                    ? "Instagram"
-                    : "Red"}
-              </a>
-            ))}
-            {guesses && guesses.length > 0 && (
-              <div className="mt-1 flex w-full flex-wrap items-center gap-1">
-                <span className="text-[11px] text-slate-400">sugeridos:</span>
-                {guesses.slice(0, 3).map((g) => (
-                  <button
-                    key={g}
-                    onClick={() => onPickEmail(g)}
-                    title="Usar este correo sugerido (dominio de la empresa)"
-                    className="rounded-md bg-indigo-50 px-1.5 py-0.5 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100"
-                  >
-                    {g}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        ) : null}
-      </div>
-      <div className="mt-3 flex flex-wrap gap-1.5">
-        {b.website && b.email === undefined && !extracting && (
-          <button
-            onClick={onExtract}
-            className="rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50"
-          >
-            Buscar correo
-          </button>
-        )}
-        {b.email === "" && (
-          <button
-            onClick={onExtract}
-            disabled={extracting}
-            className="flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-          >
-            <Icon.Refresh className="h-3.5 w-3.5" /> Reintentar
-          </button>
-        )}
-        <button
-          onClick={onSave}
-          disabled={saved}
-          className="flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-        >
-          {saved ? (
-            <>
-              <Icon.Check className="h-3.5 w-3.5" /> Guardado
-            </>
-          ) : (
-            <>
-              <Icon.Plus className="h-3.5 w-3.5" /> Guardar
-            </>
-          )}
-        </button>
-        {b.phone && wa && (
-          <a
-            href={wa}
-            target="_blank"
-            rel="noreferrer"
-            className="ml-auto flex items-center gap-1 rounded-lg bg-emerald-500 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-600"
-          >
-            <Icon.WhatsApp className="h-3.5 w-3.5" /> WhatsApp
-          </a>
-        )}
-        <button
-          onClick={onCompose}
-          className={`${b.phone && wa ? "" : "ml-auto "}rounded-lg bg-indigo-600 px-3 py-1 text-xs font-semibold text-white hover:bg-indigo-700`}
-        >
-          Propuesta
-        </button>
-      </div>
-    </CardShell>
-  );
-}
-
-function LeadCard({
-  l,
-  waTemplateBody,
-  onStatus,
-  onRemove,
-  onCompose,
-  onGhl,
-}: {
-  l: Lead;
-  waTemplateBody?: string;
-  onStatus: (s: LeadStatus) => void;
-  onRemove: () => void;
-  onCompose: () => void;
-  onGhl: () => void;
-}) {
-  const wa = l.phone ? waLink(l.phone, buildWaText(l, waTemplateBody)) : null;
-  return (
-    <CardShell>
-      <div className="flex items-start justify-between gap-2">
-        <h3 className="truncate font-semibold text-slate-900" title={l.name}>
-          {l.name}
-        </h3>
-        <span
-          className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_META[l.status].cls}`}
-        >
-          {STATUS_META[l.status].label}
-        </span>
-      </div>
-      <div className="mt-2 flex flex-1 flex-col gap-1 text-xs text-slate-600">
-        {l.phone && (
-          <span className="flex items-center gap-1.5">
-            <Icon.Phone className="h-3.5 w-3.5 text-slate-400" />
-            {l.phone}
-          </span>
-        )}
-        {l.email && (
-          <span className="flex items-center gap-1.5 font-medium text-emerald-600">
-            <Icon.Mail className="h-3.5 w-3.5" />
-            {l.email}
-          </span>
-        )}
-        {l.address && <span className="text-slate-400">{l.address}</span>}
-      </div>
-      <div className="mt-3 flex flex-wrap items-center gap-1.5">
-        <Select
-          value={l.status}
-          onChange={(v) => onStatus(v as LeadStatus)}
-          compact
-          className="w-32"
-          options={(Object.keys(STATUS_META) as LeadStatus[]).map((s) => ({
-            value: s,
-            label: STATUS_META[s].label,
-          }))}
-        />
-        {wa && (
-          <a
-            href={wa}
-            target="_blank"
-            rel="noreferrer"
-            className="flex items-center gap-1 rounded-lg bg-emerald-500 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-600"
-          >
-            <Icon.WhatsApp className="h-3.5 w-3.5" /> WhatsApp
-          </a>
-        )}
-        <button
-          onClick={onCompose}
-          className="rounded-lg bg-indigo-600 px-3 py-1 text-xs font-semibold text-white hover:bg-indigo-700"
-        >
-          Propuesta
-        </button>
-        <button
-          onClick={onGhl}
-          title="Enviar este contacto a GHL"
-          className="flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50"
-        >
-          <Icon.Send className="h-3.5 w-3.5" /> GHL
-        </button>
-        <button
-          onClick={onRemove}
-          className="ml-auto rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-rose-600 hover:bg-rose-50"
-        >
-          Quitar
-        </button>
-      </div>
-    </CardShell>
   );
 }

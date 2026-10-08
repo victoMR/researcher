@@ -12,6 +12,8 @@ interface Stats {
   byCategory: { key: string; count: number }[];
   byCity: { key: string; count: number }[];
   byScore: { score: number; count: number }[];
+  unassigned?: number;
+  byOwner?: { email: string; name: string; owned: number; contacted: number }[];
 }
 
 const STATUS_LABEL: Record<string, string> = {
@@ -151,6 +153,16 @@ export default function Dashboard() {
         </ChartCard>
       </div>
 
+      {/* Por vendedor: prospectos que trabaja y que contactó */}
+      {stats.byOwner && stats.byOwner.length > 0 && (
+        <ChartCard title="Por vendedor">
+          <OwnerList
+            rows={stats.byOwner}
+            unassigned={stats.unassigned ?? 0}
+          />
+        </ChartCard>
+      )}
+
       {/* Distribución de score */}
       {stats.byScore.length > 0 && (
         <ChartCard title="Distribución de calificación (1–10)">
@@ -204,6 +216,51 @@ function ChartCard({
     <div className="rounded-2xl border border-black/5 bg-white p-4 shadow-apple-sm">
       <h3 className="mb-3 text-sm font-semibold text-slate-700">{title}</h3>
       {children}
+    </div>
+  );
+}
+
+function OwnerList({
+  rows,
+  unassigned,
+}: {
+  rows: { email: string; name: string; owned: number; contacted: number }[];
+  unassigned: number;
+}) {
+  const max = Math.max(1, ...rows.map((r) => r.owned));
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-3 text-[11px] font-medium text-slate-400">
+        <span className="w-28 shrink-0">Vendedor</span>
+        <span className="flex-1">Prospectos que trabaja</span>
+        <span className="w-20 shrink-0 text-right">Contactados</span>
+      </div>
+      {rows.map((r) => (
+        <div key={r.email} className="flex items-center gap-3">
+          <span className="w-28 shrink-0 truncate text-xs text-slate-600" title={r.email}>
+            {r.name}
+          </span>
+          <div className="flex flex-1 items-center gap-2">
+            <div className="h-2.5 flex-1 overflow-hidden rounded-full bg-slate-100">
+              <div
+                className="h-full rounded-full bg-indigo-500"
+                style={{ width: `${Math.max(3, (r.owned / max) * 100)}%` }}
+              />
+            </div>
+            <span className="w-8 shrink-0 text-right text-xs font-semibold text-slate-700">
+              {r.owned}
+            </span>
+          </div>
+          <span className="w-20 shrink-0 text-right text-xs font-semibold text-slate-700">
+            {r.contacted}
+          </span>
+        </div>
+      ))}
+      {unassigned > 0 && (
+        <p className="pt-1 text-xs text-slate-400">
+          {unassigned} prospecto(s) sin asignar.
+        </p>
+      )}
     </div>
   );
 }

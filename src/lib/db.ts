@@ -12,6 +12,13 @@ function dbUrl(): string | undefined {
   return process.env.DATABASE_URL || process.env.POSTGRES_URL;
 }
 
+// Esquema propio (p. ej. "prospector" en el proyecto de Supabase de Finanzas,
+// con un usuario que no ve las tablas de Finanzas). Ver
+// scripts/supabase-usuario-aislado.sql. Sin DB_SCHEMA se usa el del usuario.
+function dbSchema(): string | undefined {
+  return process.env.DB_SCHEMA?.trim() || undefined;
+}
+
 export function getSql(): Sql {
   if (!_sql) {
     const url = dbUrl();
@@ -35,6 +42,8 @@ export function getSql(): Sql {
         },
       },
       onnotice: () => {}, // sin ruido por "ya existe" en los CREATE IF NOT EXISTS
+      // Refuerzo del search_path del usuario (si el pooler acepta el parámetro).
+      ...(dbSchema() ? { connection: { search_path: dbSchema()! } } : {}),
     });
   }
   return _sql;
@@ -94,6 +103,17 @@ export function ensureSchema(): Promise<void> {
 }
 
 async function migrate(sql: Sql): Promise<void> {
+  // Con DB_SCHEMA, nada se crea si la conexión no está de verdad en ese
+  // esquema (así nunca se tocan las tablas de Finanzas en "public").
+  const schema = dbSchema();
+  if (schema) {
+    const [{ s }] = await sql<{ s: string | null }[]>`SELECT current_schema() AS s`;
+    if (s !== schema) {
+      throw new Error(
+        `La conexión usa el esquema "${s ?? "ninguno"}" y no "${schema}". Revisa el usuario de la base (scripts/supabase-usuario-aislado.sql); no se creó nada.`
+      );
+    }
+  }
   await assertNoForeignTables(sql);
 
   // Prospectos guardados (persistencia + dedupe).

@@ -57,6 +57,16 @@ Etiquetas: 9–10 Completo · 7–8 Bueno · 4–6 Incompleto · 1–3 Pobre.
 - **Correo:** todo sale por GoHighLevel con el vendedor logueado como remitente, y se firma con su nombre. Antes de enviar se revisa la lista de BAJAS, siempre va la línea de baja, queda registro de cada envío y se avisa si a ese correo ya se le escribió en los últimos 30 días.
 - **Seguridad:** `AUTH_SECRET` obligatorio, límite de intentos de login, contraseñas con hash scrypt y protección SSRF.
 
+## Base de datos (Supabase, usuario aislado)
+El prospector vive en el **mismo proyecto de Supabase que Finanzas**, pero con un usuario de base de datos propio (`prospector_app`) que solo trabaja en el esquema `prospector`. Ese usuario **no puede leer ni crear nada en las tablas de Finanzas**.
+
+1. Copia de Supabase → **Connect** → *Transaction pooler* la cadena de conexión, que trae `[YOUR-PASSWORD]` como marcador.
+2. Corre `node scripts/preparar-supabase.mjs "<esa cadena>"`. Genera la contraseña del usuario y escribe `.env.supabase.sql` (el SQL listo) más `DATABASE_URL` y `DB_SCHEMA` en `.env.local`.
+3. Pega `.env.supabase.sql` en Supabase → **SQL Editor** y ejecútalo. La última fila debe decir `search_path=prospector` y `ve_tablas_de_finanzas = false`. Después borra ese archivo.
+4. Sube las variables con `node scripts/subir-env-vercel.mjs`.
+
+Para cambiar la contraseña, repite los pasos 2 a 4.
+
 ## Regla de datos (términos de Google)
 Lo que se **guarda o exporta** (Prospectos, CSV, GHL) sale de **DENUE, OpenStreetMap o la web del propio negocio**.
 
@@ -72,6 +82,7 @@ Para limpiar los datos de Google guardados antes de este cambio existe `POST /ap
 |---|---|---|
 | `DATABASE_URL` | Postgres de **Supabase**: cadena del *Transaction pooler* (puerto 6543), en Project Settings → Database → Connection string. También sirve `POSTGRES_URL` si se conecta con la integración de Supabase en Vercel. Las tablas se crean solas con RLS activo (la API pública de Supabase no las ve). Si ya existe una tabla con el mismo nombre que no es de esta app, se detiene sin modificar nada: conviene un proyecto de Supabase **dedicado** | Sí |
 | `DB_POOL_MAX` | Conexiones por instancia (3) | No |
+| `DB_SCHEMA` | Esquema propio (`prospector`) cuando se comparte el proyecto de Supabase de Finanzas con el usuario aislado `prospector_app`. Si la conexión no queda en ese esquema, la app no crea nada | Sí (proyecto compartido) |
 | `AUTH_SECRET` | Firma de sesiones, ≥ 32 caracteres. Generar: `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` | Sí (en producción) |
 | `APP_LOGIN_EMAIL` + `APP_LOGIN_PASSWORD` o `APP_USERS` | Usuarios (`correo:clave,correo2:clave2`); acepta hashes `scrypt:<salt>:<hash>` | Sí |
 | `APP_ADMINS` | Correos admin, separados por coma (si falta, el admin es `APP_LOGIN_EMAIL`) | No |

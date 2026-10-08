@@ -24,6 +24,7 @@ if (!existsSync(".env.production.local")) {
 // Llaves de servicios que el equipo suele mantener en .env.local.
 const SERVICE_KEYS = new Set([
   "DATABASE_URL",
+  "DB_SCHEMA",
   "ANTHROPIC_API_KEY",
   "DENUE_TOKEN",
   "GOOGLE_PLACES_API_KEY",

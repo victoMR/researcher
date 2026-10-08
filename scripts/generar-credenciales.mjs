@@ -72,6 +72,7 @@ env.set("MCP_TOKENS", users.map((u) => `${u.email}:${u.mcp}`).join(","));
 // Llaves de servicios: .env.local es la fuente (ahí las mantiene el equipo).
 const SERVICE_KEYS = [
   "DATABASE_URL",
+  "DB_SCHEMA",
   "DENUE_TOKEN",
   "GOOGLE_PLACES_API_KEY",
   "GHL_PIT",

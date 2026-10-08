@@ -126,6 +126,40 @@ export async function findContactByEmail(email: string) {
   );
 }
 
+// Upsert con más datos del negocio (web, dirección, ciudad, país). Lo usa
+// "Enviar a GHL" de las investigaciones con IA. Campos vacíos no se mandan.
+export async function upsertContactDetailed(input: {
+  name: string;
+  companyName?: string;
+  email?: string;
+  phone?: string;
+  website?: string;
+  address1?: string;
+  city?: string;
+  state?: string;
+  postalCode?: string;
+  country?: string; // ISO-2, p. ej. "MX"
+  source?: string;
+  tags?: string[];
+}) {
+  const body: Record<string, unknown> = { locationId: process.env.GHL_LOCATION_ID };
+  for (const [k, v] of Object.entries(input)) {
+    if (v === undefined || v === null || v === "") continue;
+    if (Array.isArray(v) && !v.length) continue;
+    body[k] = v;
+  }
+  if (!body.source) body.source = "AI Lead Shield";
+  return req(`/contacts/upsert`, { method: "POST", body: JSON.stringify(body) });
+}
+
+// Agrega una nota al contacto (contacts.write). POST /contacts/{id}/notes.
+export async function addContactNote(contactId: string, body: string) {
+  return req(`/contacts/${encodeURIComponent(contactId)}/notes`, {
+    method: "POST",
+    body: JSON.stringify({ body }),
+  });
+}
+
 // Devuelve el contactId de un correo: lo busca y si no existe lo crea.
 export async function ensureContactId(input: {
   email: string;

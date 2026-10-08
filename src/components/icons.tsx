@@ -224,3 +224,51 @@ export const Clock = (p: P) => (
     <path d="M12 6v6l4 2" />
   </Svg>
 );
+
+// --- Investigar con IA ---
+export const Sparkles = (p: P) => (
+  <Svg {...p}>
+    <path d="M12 3l1.8 4.7a2 2 0 0 0 1.2 1.2L19.5 11l-4.5 1.8a2 2 0 0 0-1.2 1.2L12 18.5l-1.8-4.5a2 2 0 0 0-1.2-1.2L4.5 11 9 9.2a2 2 0 0 0 1.2-1.2L12 3Z" />
+    <path d="M19 3v4M17 5h4M5 17v3M3.5 18.5h3" />
+  </Svg>
+);
+export const Copy = (p: P) => (
+  <Svg {...p}>
+    <rect x="9" y="9" width="12" height="12" rx="2" />
+    <path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" />
+  </Svg>
+);
+export const LinkIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+    <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+  </Svg>
+);
+export const ArrowLeft = (p: P) => (
+  <Svg {...p}>
+    <path d="M19 12H5M12 19l-7-7 7-7" />
+  </Svg>
+);
+export const ArrowRight = (p: P) => (
+  <Svg {...p}>
+    <path d="M5 12h14M12 5l7 7-7 7" />
+  </Svg>
+);
+export const AlertTriangle = (p: P) => (
+  <Svg {...p}>
+    <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+    <path d="M12 9v4M12 17h.01" />
+  </Svg>
+);
+export const Info = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="10" />
+    <path d="M12 16v-4M12 8h.01" />
+  </Svg>
+);
+export const Lightbulb = (p: P) => (
+  <Svg {...p}>
+    <path d="M9 18h6M10 22h4" />
+    <path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2Z" />
+  </Svg>
+);

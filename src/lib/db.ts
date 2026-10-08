@@ -186,5 +186,50 @@ export async function ensureSchema(): Promise<void> {
   `;
   await sql`CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts (key, created_at DESC)`;
 
+  // Ids externos del prospecto. De Google solo se puede guardar el place_id
+  // (y lat/lng por máx. 30 días -> coords_expire_at); DENUE y OSM son abiertos.
+  await sql`ALTER TABLE leads ADD COLUMN IF NOT EXISTS place_id TEXT`;
+  await sql`ALTER TABLE leads ADD COLUMN IF NOT EXISTS denue_id TEXT`;
+  await sql`ALTER TABLE leads ADD COLUMN IF NOT EXISTS coords_expire_at TIMESTAMPTZ`;
+  // Cuándo se revisaron por última vez sus datos de contacto (para el score).
+  await sql`ALTER TABLE leads ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_leads_place ON leads (place_id)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_leads_denue ON leads (denue_id)`;
+
+  // Investigaciones con IA ("busca clientes en El Refugio, Querétaro, nicho X").
+  // results/summary NUNCA llevan contenido de Google salvo place_id.
+  await sql`
+    CREATE TABLE IF NOT EXISTS research_runs (
+      id           TEXT PRIMARY KEY,
+      created_by   TEXT,
+      prompt       TEXT NOT NULL,
+      params       JSONB,                          -- nicho, zona, radio, filtros (interpretado)
+      status       TEXT NOT NULL DEFAULT 'running', -- running | done | error
+      progress     JSONB,
+      results      JSONB,                          -- prospectos (DENUE/OSM + correos)
+      summary      JSONB,                          -- análisis de la IA
+      error        TEXT,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      finished_at  TIMESTAMPTZ
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS idx_research_runs_created ON research_runs (created_at DESC)`;
+
+  // Evidencia de la "sesión" MCP de cada vendedor: lo que devolvieron las
+  // herramientas de investigación (DENUE, OSM, sitios, Google solo como señal)
+  // para validar guardar_investigacion igual que el agente interno. Expira
+  // por inactividad (ver src/lib/mcp/evidence-store.ts).
+  await sql`
+    CREATE TABLE IF NOT EXISTS mcp_evidence (
+      user_email    TEXT PRIMARY KEY,
+      businesses    JSONB NOT NULL DEFAULT '{}'::jsonb,  -- id -> negocio visto
+      sites         JSONB NOT NULL DEFAULT '{}'::jsonb,  -- host -> sitio revisado
+      meta          JSONB NOT NULL DEFAULT '{}'::jsonb,  -- zona, palabras, SCIAN, radio
+      google_calls  INTEGER NOT NULL DEFAULT 0,
+      started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `;
+
   schemaReady = true;
 }

@@ -6,6 +6,8 @@ import { LEAD_STATUSES } from "@/lib/types";
 import type { Business, LeadStatus, OwnerFilter } from "@/lib/types";
 
 export const runtime = "nodejs";
+// Guardar/vincular un resultado de Google consulta DENUE (hasta ~20 s).
+export const maxDuration = 60;
 
 function noDb() {
   return NextResponse.json(

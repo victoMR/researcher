@@ -4,8 +4,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Template } from "@/lib/templates-repo";
 import { CATEGORIES, getCategory } from "@/lib/categories";
 import type { Business, LeadMatch, Me, SearchResponse } from "@/lib/types";
+import { hasCoords, isGoogleOnly, sourceOf } from "@/lib/types";
 import { useSavedMatches } from "@/lib/useLeads";
-import { downloadCSV, isRecent, shortDate, timeAgo } from "@/lib/format";
+import { downloadCSV, isRecent, shortDate, sourceCredit, timeAgo } from "@/lib/format";
+import { computeScore } from "@/lib/scoring";
 import ComposeModal from "@/components/ComposeModal";
 import StatusTicker from "@/components/StatusTicker";
 import Select from "@/components/Select";
@@ -15,8 +17,10 @@ import BusinessCard from "@/components/BusinessCard";
 import MapView from "@/components/MapView";
 import Prospects, {
   DEFAULT_PROSPECT_FILTERS,
+  googleSkipNote,
   type ProspectFilters,
 } from "@/components/Prospects";
+import ResearchPanel from "@/components/research/ResearchPanel";
 import { EmptyState, Segmented, SkeletonCard } from "@/components/ui";
 import * as Icon from "@/components/icons";
 
@@ -34,25 +38,23 @@ const SORT_OPTIONS = [
   { value: "rating", label: "Mejor calificados" },
 ];
 
-// Calificación de prospecto 1..10 con las señales que tenemos:
-// calidad de reseñas Google + actividad reciente + facilidad de contacto + redes.
-function scoreLead(b: Business, hasSocial: boolean): number {
-  let s = 0;
-  // Calidad de calificación (máx 3)
-  if (b.rating != null) s += (b.rating / 5) * 3;
-  // Volumen de reseñas = confianza (máx 2)
-  if (b.reviewCount != null) s += Math.min(b.reviewCount / 40, 1) * 2;
-  // Actividad reciente / redes actualizadas (máx 2)
-  if (b.lastReviewTime) {
-    const days = (Date.now() - Date.parse(b.lastReviewTime)) / 86400000;
-    s += days <= 30 ? 2 : days <= 90 ? 1.5 : days <= 180 ? 1 : days <= 365 ? 0.5 : 0;
-  }
-  // Facilidad de contacto (máx 3): teléfono + web/redes + correo
-  if (b.phone) s += 1;
-  if (b.website || hasSocial) s += 1;
-  if (b.email) s += 1;
-  return Math.max(1, Math.min(10, Math.round(s)));
+// Calificación de prospecto 1..10 POR RESTA (src/lib/scoring.ts): 10 = datos
+// completos y activo; cada dato faltante o viejo resta puntos.
+function scoreLead(b: Business, websiteOk: boolean) {
+  return computeScore({
+    phone: b.phone,
+    email: b.email,
+    emailIsGuess: b.emailIsGuess,
+    website: b.website,
+    address: b.address,
+    businessStatus: b.status,
+    lastActivityAt: b.lastReviewTime,
+    websiteOk,
+  });
 }
+
+// Liga oficial para pedir el token gratis del DENUE (formulario "Obtener Token").
+const DENUE_TOKEN_URL = "https://www.inegi.org.mx/servicios/api_denue.html";
 
 // Distancia en km entre dos coordenadas (haversine).
 function distanceKm(
@@ -72,9 +74,12 @@ function distanceKm(
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-type Tab = "buscar" | "prospectos" | "plantillas" | "metricas";
+type Tab = "investigar" | "buscar" | "prospectos" | "plantillas" | "metricas";
+const TABS: Tab[] = ["investigar", "buscar", "prospectos", "plantillas", "metricas"];
 type View = "lista" | "mapa";
-type SearchMode = "google" | "general";
+// denue = México con DENUE (base, se guarda/exporta); google = solo consulta;
+// general = mundial con OpenStreetMap (gratis).
+type SearchMode = "denue" | "google" | "general";
 
 // Última búsqueda mostrada (para "Cargar más" y "Actualizar").
 interface SearchQuery {
@@ -87,14 +92,16 @@ function searchBody(qy: SearchQuery, extra: { refresh?: boolean; pageToken?: str
   return JSON.stringify({
     city: qy.city,
     category: qy.category,
-    source: qy.mode === "general" ? "osm" : undefined,
+    source: qy.mode === "general" ? "osm" : qy.mode === "denue" ? "denue" : undefined,
     global: qy.mode === "general",
     ...extra,
   });
 }
 
 export default function Home() {
-  const [tab, setTab] = useState<Tab>("buscar");
+  const [tab, setTab] = useState<Tab>("investigar");
+  // Investigación abierta en la pestaña IA (sobrevive al cambiar de pestaña).
+  const [researchId, setResearchId] = useState<string | null>(null);
   const [view, setView] = useState<View>("lista");
   const [city, setCity] = useState("");
   const [category, setCategory] = useState(CATEGORIES[0].slug);
@@ -111,6 +118,13 @@ export default function Home() {
   const [guesses, setGuesses] = useState<Record<string, string[]>>({});
   const [autoProgress, setAutoProgress] = useState<{ done: number; total: number } | null>(null);
   const [mode, setMode] = useState<SearchMode>("google");
+  // ¿El servidor tiene DENUE_TOKEN? (null = aún no sabemos)
+  const [denueAvailable, setDenueAvailable] = useState<boolean | null>(null);
+  const modeTouched = useRef(false);
+  // Sitios web que sí se pudieron leer al sacar el correo (señal de actividad del score).
+  const [siteOk, setSiteOk] = useState<Record<string, boolean>>({});
+  // Aviso tras exportar resultados (cuántos de Google se omitieron).
+  const [exportNote, setExportNote] = useState<string | null>(null);
   const [userCoords, setUserCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [locating, setLocating] = useState(false);
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -135,6 +149,23 @@ export default function Home() {
       })
       .catch(() => {});
   }, []);
+
+  // Fuentes del servidor: con DENUE_TOKEN el modo por defecto es DENUE.
+  useEffect(() => {
+    fetch("/api/search")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { denueAvailable?: boolean } | null) => {
+        const ok = !!d?.denueAvailable;
+        setDenueAvailable(ok);
+        if (ok && !modeTouched.current) setMode("denue");
+      })
+      .catch(() => setDenueAvailable(false));
+  }, []);
+
+  function pickMode(m: SearchMode) {
+    modeTouched.current = true;
+    setMode(m);
+  }
 
   // Carga plantillas (para usarlas en WhatsApp y en la propuesta). Se refresca
   // al volver a Buscar/Prospectos por si creaste plantillas nuevas.
@@ -213,6 +244,9 @@ export default function Home() {
         setSource(data.source || null);
         setSocials({});
         setGuesses({});
+        setSiteOk({});
+        setExportNote(null);
+        if (typeof data.denueAvailable === "boolean") setDenueAvailable(data.denueAvailable);
         setLastQuery(qy);
         setNextPageToken(data.nextPageToken || null);
         setCacheInfo(data.cached ? { cachedAt: data.cachedAt } : null);
@@ -285,8 +319,18 @@ export default function Home() {
         setSocials((s) => ({ ...s, [b.id]: data.socials }));
       if (data.guesses?.length)
         setGuesses((s) => ({ ...s, [b.id]: data.guesses }));
+      // El sitio respondió con contenido: cuenta como señal de actividad (score).
+      const readable =
+        res.ok &&
+        !data.error &&
+        [data.emails, data.socials, data.phones, data.signals].some(
+          (v) => Array.isArray(v) && v.length > 0
+        );
+      if (readable) setSiteOk((s) => ({ ...s, [b.id]: true }));
       setResults((rs) =>
-        rs.map((r) => (r.id === b.id ? { ...r, email: email ?? "" } : r))
+        rs.map((r) =>
+          r.id === b.id ? { ...r, email: email ?? "", emailIsGuess: email ? false : r.emailIsGuess } : r
+        )
       );
       // Si ya estaba guardado (y es mío o sin dueño), guarda el correo.
       const m = matchRef.current(b);
@@ -349,7 +393,10 @@ export default function Home() {
 
   // Elige un correo sugerido (dominio de la matriz) como el correo del negocio.
   function pickEmail(b: Business, email: string) {
-    setResults((rs) => rs.map((r) => (r.id === b.id ? { ...r, email } : r)));
+    // Sugerido = no lo publicó el negocio: resta en el score hasta confirmarlo.
+    setResults((rs) =>
+      rs.map((r) => (r.id === b.id ? { ...r, email, emailIsGuess: true } : r))
+    );
     const m = matchFor(b);
     if (m && canTouch(m)) updateSaved(b, m, { email });
   }
@@ -387,42 +434,58 @@ export default function Home() {
     setAutoProgress(null);
   }
 
+  // CSV solo con datos abiertos (DENUE / OSM): los de Google no se exportan.
   function exportResultsCSV(rows: Business[]) {
-    downloadCSV(
-      "negocios.csv",
-      ["Score", "Nombre", "Giro", "Correo", "Teléfono", "Web", "Rating", "Reseñas", "Dirección"],
-      rows.map((r) => [
-        r.score,
-        r.name,
-        r.category,
-        r.email,
-        r.phone,
-        r.website,
-        r.rating,
-        r.reviewCount,
-        r.address,
-      ])
+    const open = rows.filter((r) => !isGoogleOnly(r));
+    const google = rows.length - open.length;
+    if (open.length) {
+      downloadCSV(
+        "negocios.csv",
+        ["Score", "Nombre", "Giro", "Correo", "Teléfono", "Web", "Dirección", "Personal", "Fuente"],
+        open.map((r) => [
+          r.score,
+          r.name,
+          r.category,
+          r.email,
+          r.phone,
+          r.website,
+          r.address,
+          r.employees,
+          sourceOf(r) === "denue" ? "INEGI, DENUE" : "© OpenStreetMap contributors",
+        ])
+      );
+    }
+    setExportNote(
+      google ? (open.length ? "" : "No hay nada que exportar. ") + googleSkipNote(google) : null
     );
   }
 
   // Resultados con score + distancia (si hay ubicación) + filtro + orden.
   const filteredResults = useMemo(() => {
-    let r = results.map((b) => ({
-      ...b,
-      score: scoreLead(b, (socials[b.id]?.length ?? 0) > 0),
-      distanceKm: userCoords
-        ? distanceKm(userCoords.lat, userCoords.lon, b.lat, b.lon)
-        : undefined,
-    }));
-    if (onlyActive) r = r.filter((b) => isRecent(b.lastReviewTime));
+    let r = results.map((b) => {
+      const s = scoreLead(b, !!siteOk[b.id]);
+      return {
+        ...b,
+        score: s.score,
+        scoreDeductions: s.deductions,
+        distanceKm:
+          userCoords && hasCoords(b)
+            ? distanceKm(userCoords.lat, userCoords.lon, b.lat, b.lon)
+            : undefined,
+      };
+    });
+    // "Solo activos" y los órdenes por reseñas solo aplican con señales de Google.
+    const hasAct = results.some((b) => b.lastReviewTime || b.rating != null);
+    if (onlyActive && hasAct) r = r.filter((b) => isRecent(b.lastReviewTime));
+    const by = hasAct || sortBy === "cercanos" ? sortBy : "score";
     const sorted = [...r];
-    if (sortBy === "score") {
+    if (by === "score") {
       sorted.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-    } else if (sortBy === "cercanos") {
+    } else if (by === "cercanos") {
       sorted.sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
-    } else if (sortBy === "resenas") {
+    } else if (by === "resenas") {
       sorted.sort((a, b) => (b.reviewCount ?? 0) - (a.reviewCount ?? 0));
-    } else if (sortBy === "rating") {
+    } else if (by === "rating") {
       sorted.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
     } else {
       sorted.sort(
@@ -432,15 +495,7 @@ export default function Home() {
       );
     }
     return sorted;
-  }, [results, onlyActive, sortBy, userCoords, socials]);
-
-  const sortOptions = useMemo(
-    () =>
-      userCoords
-        ? [{ value: "cercanos", label: "Más cercanos" }, ...SORT_OPTIONS]
-        : SORT_OPTIONS,
-    [userCoords]
-  );
+  }, [results, onlyActive, sortBy, userCoords, siteOk]);
 
   const activeCount = useMemo(
     () => results.filter((b) => isRecent(b.lastReviewTime)).length,
@@ -451,6 +506,15 @@ export default function Home() {
     [results]
   );
 
+  // Sin señales de Google (DENUE / OSM) solo aplican "Mejor prospecto" y cercanía.
+  const sortOptions = useMemo(() => {
+    const base = hasActivityData ? SORT_OPTIONS : SORT_OPTIONS.slice(0, 1);
+    return userCoords ? [{ value: "cercanos", label: "Más cercanos" }, ...base] : base;
+  }, [userCoords, hasActivityData]);
+
+  // Resultados de Google en la lista actual (no se exportan ni van al mapa).
+  const googleCount = useMemo(() => results.filter((b) => isGoogleOnly(b)).length, [results]);
+
   const isSearch = tab === "buscar";
   const hasResults = isSearch && results.length > 0; // hay búsqueda (aunque el filtro oculte todo)
   const showResults = isSearch && filteredResults.length > 0;
@@ -459,7 +523,7 @@ export default function Home() {
     <div className="min-h-screen bg-slate-50">
       {/* Barra superior */}
       <header className="sticky top-0 z-20 border-b border-black/5 bg-white/70 backdrop-blur-xl backdrop-saturate-150">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3">
           <div className="flex items-center gap-2.5">
             <span className="grid h-9 w-9 place-items-center rounded-2xl bg-gradient-to-b from-indigo-500 to-indigo-600 text-white shadow-apple-sm">
               <Icon.Shield className="h-5 w-5" />
@@ -473,28 +537,42 @@ export default function Home() {
               </p>
             </div>
           </div>
-          <nav className="flex gap-1 rounded-full bg-black/[0.04] p-1">
-            {(["buscar", "prospectos", "plantillas", "metricas"] as Tab[]).map((t) => (
+          <nav className="flex max-w-full gap-1 overflow-x-auto rounded-full bg-black/[0.04] p-1 [scrollbar-width:none]">
+            {TABS.map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
-                className={`rounded-full px-4 py-1.5 text-sm font-medium capitalize transition ${
+                aria-current={tab === t ? "page" : undefined}
+                className={`shrink-0 whitespace-nowrap rounded-full px-4 py-1.5 text-sm font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
+                  t === "investigar" ? "" : "capitalize"
+                } ${
                   tab === t
                     ? "bg-white text-slate-900 shadow-apple-sm"
                     : "text-slate-500 hover:text-slate-800"
                 }`}
               >
-                {t === "prospectos" && mineCount
-                  ? `Prospectos (${mineCount})`
-                  : t === "metricas"
-                    ? "Métricas"
-                    : t}
+                {t === "investigar" ? (
+                  <span className="flex items-center gap-1.5">
+                    <Icon.Sparkles
+                      className={`h-3.5 w-3.5 ${tab === t ? "text-violet-600" : "text-violet-500"}`}
+                    />
+                    <span className="sm:hidden">IA</span>
+                    <span className="hidden sm:inline">Investigar con IA</span>
+                  </span>
+                ) : t === "prospectos" && mineCount ? (
+                  `Prospectos (${mineCount})`
+                ) : t === "metricas" ? (
+                  "Métricas"
+                ) : (
+                  t
+                )}
               </button>
             ))}
             <button
               onClick={logout}
               title={me ? `Cerrar sesión (${me.email})` : "Cerrar sesión"}
-              className="ml-1 grid h-8 w-8 place-items-center rounded-full text-slate-400 transition hover:bg-black/[0.04] hover:text-slate-700"
+              aria-label="Cerrar sesión"
+              className="ml-1 grid h-8 w-8 shrink-0 place-items-center rounded-full text-slate-400 transition hover:bg-black/[0.04] hover:text-slate-700"
             >
               <Icon.LogOut className="h-4 w-4" />
             </button>
@@ -503,6 +581,14 @@ export default function Home() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-8">
+        {tab === "investigar" && (
+          <ResearchPanel
+            me={me}
+            openId={researchId}
+            onOpen={setResearchId}
+            onChanged={() => refreshSaved()}
+          />
+        )}
         {tab === "metricas" && <Dashboard />}
         {tab === "plantillas" && <Templates />}
         {tab === "prospectos" && (
@@ -572,17 +658,25 @@ export default function Home() {
             </form>
 
             {/* Selector de modo de búsqueda */}
-            <div className="mt-3 flex items-center justify-center gap-2 text-xs">
+            <div className="mt-3 flex flex-wrap items-center justify-center gap-2 text-xs">
               <span className="text-slate-400">Modo:</span>
               <Segmented<SearchMode>
                 value={mode}
-                onChange={setMode}
+                onChange={pickMode}
                 options={[
+                  {
+                    value: "denue",
+                    label: (
+                      <>
+                        <Icon.Building className="h-3.5 w-3.5" /> México · DENUE (recomendado)
+                      </>
+                    ),
+                  },
                   {
                     value: "google",
                     label: (
                       <>
-                        <Icon.Target className="h-3.5 w-3.5" /> México (Google)
+                        <Icon.Target className="h-3.5 w-3.5" /> Google (solo consulta)
                       </>
                     ),
                   },
@@ -590,7 +684,7 @@ export default function Home() {
                     value: "general",
                     label: (
                       <>
-                        <Icon.Globe className="h-3.5 w-3.5" /> General · mundial (gratis)
+                        <Icon.Globe className="h-3.5 w-3.5" /> Mundial · OSM (gratis)
                       </>
                     ),
                   },
@@ -598,10 +692,27 @@ export default function Home() {
               />
             </div>
             <p className="mt-1 text-center text-xs text-slate-400">
-              {mode === "google"
-                ? "Mejor cobertura en México. Usa la API de Google."
-                : "Cualquier ciudad del mundo con OpenStreetMap. No gasta cuota de Google."}
+              {mode === "denue"
+                ? "Directorio oficial de INEGI: todo México, gratis. Se guarda, se exporta a CSV y va a GHL."
+                : mode === "google"
+                  ? "Consulta en vivo con Google. Sus datos no se exportan ni se pintan en el mapa; al guardar se vinculan con DENUE."
+                  : "Cualquier ciudad del mundo con OpenStreetMap. No gasta cuota de Google."}
             </p>
+            {denueAvailable === false && (mode === "denue" || mode === "google") && (
+              <p className="mx-auto mt-2 max-w-xl rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-left text-xs text-amber-800">
+                <b>DENUE no está configurado</b> en el servidor (falta <code>DENUE_TOKEN</code>
+                ). Mientras tanto se usa Google u OpenStreetMap. El token es gratis:{" "}
+                <a
+                  href={DENUE_TOKEN_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-semibold text-indigo-700 underline"
+                >
+                  pídelo en la página del API del DENUE (INEGI)
+                </a>
+                .
+              </p>
+            )}
           </section>
         )}
 
@@ -622,8 +733,17 @@ export default function Home() {
                 <span className="flex flex-wrap items-center gap-y-1 text-sm font-medium text-slate-600">
                   {filteredResults.length} negocios
                   {source && (
-                    <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">
-                      {source === "google" ? "Google" : "OSM (gratis)"}
+                    <span
+                      className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500"
+                      title={sourceCredit(
+                        source === "denue" ? "denue" : source === "google" ? "google" : "osm"
+                      )}
+                    >
+                      {source === "denue"
+                        ? "DENUE (INEGI)"
+                        : source === "google"
+                          ? "Google · solo consulta"
+                          : "OSM (gratis)"}
                     </span>
                   )}
                   {cacheInfo && (
@@ -658,27 +778,27 @@ export default function Home() {
             {hasResults && !loading && (
               <div className="flex flex-wrap items-center gap-2">
                 {hasActivityData && (
-                  <>
-                    <button
-                      onClick={() => setOnlyActive((v) => !v)}
-                      title="Sólo negocios con reseñas de los últimos 6 meses"
-                      className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition ${
-                        onlyActive
-                          ? "bg-emerald-600 text-white shadow-apple-sm"
-                          : "border border-black/10 bg-white text-slate-600 hover:bg-slate-50"
-                      }`}
-                    >
-                      <Icon.Flame className="h-3.5 w-3.5" /> Solo activos ({activeCount})
-                    </button>
-                    <Select
-                      value={sortBy}
-                      onChange={setSortBy}
-                      options={sortOptions}
-                      align="right"
-                      compact
-                      className="w-40"
-                    />
-                  </>
+                  <button
+                    onClick={() => setOnlyActive((v) => !v)}
+                    title="Sólo negocios con reseñas de los últimos 6 meses"
+                    className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                      onlyActive
+                        ? "bg-emerald-600 text-white shadow-apple-sm"
+                        : "border border-black/10 bg-white text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    <Icon.Flame className="h-3.5 w-3.5" /> Solo activos ({activeCount})
+                  </button>
+                )}
+                {sortOptions.length > 1 && (
+                  <Select
+                    value={sortOptions.some((o) => o.value === sortBy) ? sortBy : "score"}
+                    onChange={setSortBy}
+                    options={sortOptions}
+                    align="right"
+                    compact
+                    className="w-40"
+                  />
                 )}
                 <Segmented<View>
                   value={view}
@@ -704,6 +824,11 @@ export default function Home() {
                 />
                 <button
                   onClick={() => exportResultsCSV(filteredResults)}
+                  title={
+                    googleCount
+                      ? "Descarga solo datos abiertos (DENUE / OSM): los de Google no se exportan por sus términos"
+                      : "Descargar estos resultados"
+                  }
                   className="flex items-center gap-1.5 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
                 >
                   <Icon.Download className="h-3.5 w-3.5" /> CSV
@@ -714,12 +839,36 @@ export default function Home() {
         )}
 
         {/* Aviso modo gratis */}
-        {isSearch && !loading && source === "osm" && mode === "google" && (
+        {isSearch && !loading && source === "osm" && mode !== "general" && (
           <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            Estás en <b>modo gratis (OSM)</b>: bueno para agencias de autos, pero
-            casi sin datos de seminuevos e inmobiliarias. Agrega tu key de Google
-            Places (<code>GOOGLE_PLACES_API_KEY</code>) para cobertura completa.
+            Estás viendo <b>OpenStreetMap (gratis)</b>: bueno para agencias de autos,
+            pero casi sin datos de talleres, seminuevos e inmobiliarias. Para todo
+            México usa el modo <b>DENUE</b> (agrega <code>DENUE_TOKEN</code>, es gratis).
           </p>
+        )}
+
+        {/* Datos de Google: solo consulta */}
+        {isSearch && !loading && googleCount > 0 && (
+          <p className="mb-4 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-600">
+            {googleCount === 1 ? "1 resultado es" : `${googleCount} resultados son`} de{" "}
+            <b>Google</b>: solo para consultar. No se exportan a CSV ni a GHL y no se
+            pintan en el mapa. Al guardarlos se buscan en DENUE; si no aparecen se guarda
+            lo mínimo y desde Prospectos puedes vincularlos con DENUE.
+          </p>
+        )}
+
+        {/* Aviso tras exportar */}
+        {isSearch && exportNote && !loading && (
+          <div className="mb-4 flex items-start justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            <span>{exportNote}</span>
+            <button
+              onClick={() => setExportNote(null)}
+              title="Cerrar aviso"
+              className="grid h-6 w-6 shrink-0 place-items-center rounded-full text-amber-700 hover:bg-amber-100"
+            >
+              <Icon.X className="h-3.5 w-3.5" />
+            </button>
+          </div>
         )}
 
         {/* Aviso de la búsqueda (p. ej. tope de gasto o datos parciales) */}

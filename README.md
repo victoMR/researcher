@@ -1,44 +1,40 @@
-# 🎯 Prospector
+# AI Lead Shield · Prospector
 
-Herramienta todo-en-uno para investigar clientes potenciales: busca negocios por **giro + ciudad**, los localiza en un **mapa**, saca su **correo** y te deja **mandarles propuesta** — con un mini-CRM de prospectos.
+Herramienta interna de prospección B2B en México. Un agente con IA investiga clientes potenciales en lenguaje natural ("clínicas dentales activas en El Refugio, Querétaro") y entrega un reporte con ranking, el porqué de cada negocio y un mensaje sugerido. Desde ahí se descarga el **CSV** o se manda a **GoHighLevel**, que es la base de clientes.
 
 ## Qué hace
 
-- **Buscar** negocios por giro (agencias, seminuevos, inmobiliarias/corretaje, talleres) y ciudad de México.
-  - Datos de **OpenStreetMap** (Nominatim + Overpass) — gratis, sin API key.
-- **Mapa** con todos los negocios encontrados (Leaflet + tiles de OSM).
-- **Sacar correo**: al negocio con página web, extrae correos de su home y páginas de contacto.
-- **Prospectos**: guarda leads (en el navegador), cámbiales estado (nuevo / contactado / respondió / descartado), exporta a **CSV**.
-- **Propuesta**: redacta y envía el correo con **Resend**, o ábrelo en tu cliente de correo, o copia el texto.
+- **Investigar con IA:** Claude con herramientas busca en DENUE (INEGI), OpenStreetMap, la web y Google (este último solo como referencia). Revisa los sitios de los negocios, cruza con los prospectos existentes y con las BAJAS, y califica.
+- **Buscar:** búsqueda directa por giro y ciudad (DENUE, Google u OSM), con mapa y extracción de correos.
+- **Prospectos:** mini-CRM por vendedor, con dueño, estados, notas, buscador, filtros, CSV y envío a GHL.
+- **Calificación por resta (1–10):** 10 = datos completos y actividad reciente; cada dato que falta o está viejo resta puntos, y siempre se muestra el desglose.
+- **Propuestas:** correo por GoHighLevel con el vendedor logueado como remitente, o WhatsApp. Antes de enviar se revisa la lista de BAJAS y queda registro de cada envío.
+- **Servidor MCP:** las mismas herramientas para usarlas desde Claude Code o Claude Desktop.
 
 ## Correr en local
+
+```bash
+npm install
+```
 
 ```bash
 npm run dev
 ```
 
-Abre http://localhost:3000 (o el puerto que indique la consola).
+Necesita al menos `DATABASE_URL`, `AUTH_SECRET` y un usuario (`APP_LOGIN_EMAIL` y `APP_LOGIN_PASSWORD`). La lista completa de variables está en [docs/README.md](docs/README.md#variables-de-entorno).
 
-## Envío de correo (Resend)
+## Documentación
 
-1. Acepta los términos de Resend (link que te dio el asistente, o `vercel integration open resend/resend-email`).
-2. Instala la integración:
-   ```bash
-   vercel integration add resend/resend-email --no-claim
-   ```
-3. Trae las variables de entorno:
-   ```bash
-   vercel env pull
-   ```
-4. En Resend, **verifica tu dominio** y pon el remitente en `RESEND_FROM` (ej. `Ventas <ventas@tudominio.com>`).
+- [docs/README.md](docs/README.md): qué está construido, la regla de datos de Google, las variables de entorno y el roadmap.
+- [docs/fuentes-de-datos-mexico.md](docs/fuentes-de-datos-mexico.md): DENUE, Google, OSM y el marco legal.
+- [docs/tiempo-real-y-arquitectura.md](docs/tiempo-real-y-arquitectura.md): señales, arquitectura y mapa nacional.
+- [docs/mcp.md](docs/mcp.md): conectar Claude Code o Claude Desktop.
 
-Sin esto, el botón "Enviar con Resend" avisa que falta config; el botón "Abrir en mi correo" funciona siempre.
+## Buenas prácticas de envío
 
-## Buenas prácticas de envío (¡importante!)
-
-- Cold email masivo desde tu dominio principal **quema tu reputación**. Para lotes grandes, usa dominio aparte + calentamiento + herramienta dedicada (Instantly/Smartlead) — exporta el CSV desde aquí.
-- Manda pocos y calientes. Incluye siempre la línea de baja ("responde BAJA").
+- El cold email masivo desde el dominio principal **quema su reputación**. Para volumen, usa un dominio aparte con calentamiento, SPF, DKIM y DMARC.
+- Manda pocos correos y bien dirigidos. La línea de baja ("responda BAJA") se agrega sola.
 
 ## Stack
 
-Next.js 16 (App Router) · TypeScript · Tailwind · Leaflet · Resend · OpenStreetMap.
+Next.js 16 (App Router) · TypeScript · Tailwind 4 · Neon Postgres · Claude API · GoHighLevel · Leaflet · DENUE (INEGI) · OpenStreetMap.

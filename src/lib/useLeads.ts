@@ -52,6 +52,30 @@ export async function patchLead(
   }
 }
 
+// "Vincular con DENUE" (prospectos solo-Google): el servidor busca el mismo
+// negocio en DENUE y, si lo encuentra, completa el prospecto con esos datos.
+export async function linkDenue(
+  id: string
+): Promise<ApiResult & { matched?: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/leads/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ linkDenue: true }),
+    });
+    const d = await readJson(res);
+    if (!res.ok) return { ok: false, error: (d.error as string) || "No se pudo vincular." };
+    return {
+      ok: true,
+      lead: d.lead as Lead | undefined,
+      matched: !!d.matched,
+      message: d.message as string | undefined,
+    };
+  } catch {
+    return { ok: false, error: "Error de red al vincular con DENUE." };
+  }
+}
+
 export async function deleteLead(id: string): Promise<ApiResult> {
   try {
     const res = await fetch(`/api/leads/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -166,6 +190,8 @@ function toMatch(l: Lead, key: string): LeadMatch {
     status: l.status,
     contactedBy: l.contactedBy ?? null,
     contactedAt: l.contactedAt ?? null,
+    placeId: l.placeId ?? null,
+    denueId: l.denueId ?? null,
   };
 }
 
@@ -217,6 +243,9 @@ export function useSavedMatches(meEmail?: string | null) {
         for (const m of d.matches ?? []) {
           next[kKey(m.key)] = m;
           next[kId(m.id)] = m;
+          // Un resultado de Google/DENUE guardado con otro id (p. ej. vinculado).
+          if (m.placeId) next[kId(`place/${m.placeId}`)] = m;
+          if (m.denueId) next[kId(`denue/${m.denueId}`)] = m;
         }
         setMap((prev) => (mode === "refresh" ? next : { ...prev, ...next }));
       } catch {

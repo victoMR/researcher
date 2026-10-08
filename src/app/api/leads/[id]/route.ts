@@ -3,6 +3,7 @@ import { hasDb } from "@/lib/db";
 import {
   claimLead,
   getLead,
+  linkLeadToDenue,
   logLeadEvent,
   removeLead,
   updateLead,
@@ -13,6 +14,8 @@ import { LEAD_STATUSES } from "@/lib/types";
 import type { Lead, LeadStatus } from "@/lib/types";
 
 export const runtime = "nodejs";
+// Guardar/vincular un resultado de Google consulta DENUE (hasta ~20 s).
+export const maxDuration = 60;
 
 type Ctx = { params: Promise<{ id: string }> };
 
@@ -40,10 +43,31 @@ export async function PATCH(req: NextRequest, { params }: Ctx) {
       email?: string;
       claim?: boolean;
       owner?: string | null;
+      linkDenue?: boolean; // "Vincular con DENUE" (prospectos solo-Google)
     };
 
     let lead = await getLead(id);
     if (!lead) return err("Prospecto no encontrado.", 404);
+
+    // Vincular con DENUE: busca el mismo negocio y completa con datos abiertos.
+    if (body.linkDenue) {
+      const denied = forbidden(lead, me, admin);
+      if (denied) return denied;
+      const r = await linkLeadToDenue(id);
+      if (r.matched && r.lead) {
+        await logLeadEvent("denue_linked", {
+          leadId: id,
+          actor: me,
+          meta: { denueId: r.lead.denueId },
+        }).catch((e) => console.error("lead PATCH event", e));
+      }
+      return NextResponse.json({
+        ok: true,
+        matched: r.matched,
+        message: r.message,
+        lead: r.lead ?? lead,
+      });
+    }
 
     // Tomar un prospecto sin dueño.
     if (body.claim) {

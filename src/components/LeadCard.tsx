@@ -2,11 +2,20 @@
 
 import { useRef, useState } from "react";
 import type { Lead, LeadStatus, Me } from "@/lib/types";
-import { LEAD_STATUSES } from "@/lib/types";
+import { LEAD_STATUSES, googleMapsUrl, isGoogleOnly, placeIdOf, sourceOf } from "@/lib/types";
 import { buildWaText, logWhatsApp, waLink } from "@/lib/wa";
-import { firstName, personName, shortDate, timeAgo } from "@/lib/format";
+import {
+  firstName,
+  personName,
+  scoreColor,
+  shortDate,
+  sourceCredit,
+  timeAgo,
+} from "@/lib/format";
+import { formatBreakdown, scoreLabel } from "@/lib/scoring";
 import { lookupEmails } from "@/lib/useLeads";
 import Select from "@/components/Select";
+import { ScoreBadge } from "@/components/BusinessCard";
 import { CardShell, STATUS_META } from "@/components/ui";
 import * as Icon from "@/components/icons";
 
@@ -32,6 +41,7 @@ export default function LeadCard({
   onRemove,
   onCompose,
   onGhl,
+  onLinkDenue,
 }: {
   l: Lead;
   me: Me | null;
@@ -45,6 +55,7 @@ export default function LeadCard({
   onRemove: () => void;
   onCompose: () => void;
   onGhl: () => void;
+  onLinkDenue?: () => Promise<void>; // solo-Google: buscarlo en DENUE
 }) {
   const owner = l.ownerEmail ?? null;
   const mine = !!owner && owner === me?.email;
@@ -52,6 +63,20 @@ export default function LeadCard({
   const lockMsg = canEdit || !owner ? undefined : `Este prospecto lo trabaja ${personName(owner)}.`;
   const contactedMine = !!l.contactedBy && l.contactedBy === me?.email;
   const wa = l.phone ? waLink(l.phone, buildWaText(l, waTemplateBody, me?.name)) : null;
+  // Solo-Google: no se exporta (CSV/GHL) hasta vincularlo con DENUE.
+  const googleOnly = isGoogleOnly(l);
+  const placeId = placeIdOf(l);
+  const [linking, setLinking] = useState(false);
+
+  async function linkDenue() {
+    if (!onLinkDenue || linking) return;
+    setLinking(true);
+    try {
+      await onLinkDenue();
+    } finally {
+      setLinking(false);
+    }
+  }
 
   // Nota inline: se guarda al salir del campo.
   const [editing, setEditing] = useState(false);
@@ -118,15 +143,31 @@ export default function LeadCard({
   return (
     <CardShell>
       <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <h3 className="truncate font-semibold text-slate-900" title={l.name}>
-            {l.name}
-          </h3>
-          {(l.category || l.city) && (
-            <p className="truncate text-xs text-slate-400">
-              {[l.category, l.city].filter(Boolean).join(" · ")}
-            </p>
+        <div className="flex min-w-0 items-start gap-2">
+          {l.score != null && (
+            <span
+              className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg text-sm font-bold ${scoreColor(l.score)}`}
+              title={`Calificación de prospecto (1–10, por resta): ${formatBreakdown({
+                score: l.score,
+                max: 10,
+                deductions: l.scoreDeductions ?? [],
+                label: scoreLabel(l.score),
+              })}`}
+            >
+              {l.score}
+            </span>
           )}
+          <div className="min-w-0">
+            <h3 className="truncate font-semibold text-slate-900" title={l.name}>
+              {l.name}
+            </h3>
+            {(l.category || l.city) && (
+              <p className="truncate text-xs text-slate-400">
+                {[l.category, l.city].filter(Boolean).join(" · ")}
+              </p>
+            )}
+            {l.score != null && <ScoreBadge score={l.score} deductions={l.scoreDeductions} />}
+          </div>
         </div>
         <span
           className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_META[l.status]?.cls ?? STATUS_META.nuevo.cls}`}
@@ -260,6 +301,43 @@ export default function LeadCard({
         {l.address && <span className="line-clamp-2 text-slate-400">{l.address}</span>}
       </div>
 
+      {/* Solo-Google: sus términos no dejan guardar ni exportar sus datos */}
+      {googleOnly && (
+        <div className="mt-2 rounded-lg bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
+          <p>
+            De Google: solo se guardó lo mínimo. No se exporta a CSV ni a GHL hasta
+            vincularlo con DENUE.
+          </p>
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+            {onLinkDenue && (
+              <button
+                onClick={linkDenue}
+                disabled={!canEdit || linking}
+                title={lockMsg ?? "Buscar este negocio en DENUE (INEGI) y completar sus datos"}
+                className="flex items-center gap-1 rounded-md bg-white px-1.5 py-0.5 font-semibold text-indigo-700 shadow-apple-sm hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {linking ? (
+                  <Icon.Loader className="h-3 w-3" />
+                ) : (
+                  <Icon.LinkIcon className="h-3 w-3" />
+                )}
+                {linking ? "Buscando en DENUE…" : "Vincular con DENUE"}
+              </button>
+            )}
+            {placeId && (
+              <a
+                href={googleMapsUrl(placeId)}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-0.5 font-medium text-indigo-600 hover:underline"
+              >
+                Ver en Google Maps <Icon.ExternalLink className="h-3 w-3" />
+              </a>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Nota */}
       <div className="mt-2">
         {editing ? (
@@ -375,8 +453,13 @@ export default function LeadCard({
       <div className="mt-2 flex flex-wrap items-center gap-1 border-t border-black/5 pt-2">
         <button
           onClick={onGhl}
-          disabled={!canEdit}
-          title={lockMsg ?? "Enviar este contacto a GHL"}
+          disabled={!canEdit || googleOnly}
+          title={
+            lockMsg ??
+            (googleOnly
+              ? "De Google: no se envía a GHL por sus términos. Vincúlalo con DENUE."
+              : "Enviar este contacto a GHL")
+          }
           className={`${btn} text-slate-500 hover:bg-slate-50 hover:text-slate-800`}
         >
           <Icon.Send className="h-3.5 w-3.5" /> GHL
@@ -400,6 +483,7 @@ export default function LeadCard({
           <Icon.Trash className="h-3.5 w-3.5" /> Quitar
         </button>
       </div>
+      <p className="mt-1 text-[10px] text-slate-400">{sourceCredit(sourceOf(l))}</p>
     </CardShell>
   );
 }

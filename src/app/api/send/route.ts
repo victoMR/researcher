@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { Resend } from "resend";
 import {
   emailStatusFrom,
   ensureContactId,
@@ -27,68 +26,11 @@ export const runtime = "nodejs";
 // Días en los que avisamos si alguien del equipo ya le escribió a ese correo.
 const DUP_WINDOW_DAYS = 30;
 
-// Cómo se arma el remitente:
-//  - "shared" (default): la dirección es siempre GHL_EMAIL_FROM (el buzón SMTP
-//    de GoDaddy, que es el único que ese servidor deja usar), pero el NOMBRE
-//    visible es el del vendedor -> "Aldo (AI Lead Shield) <contact@...>".
-//  - "peruser": la dirección es la del vendedor. Solo sirve con un proveedor
-//    que permita cualquier buzón del dominio (LeadConnector con dominio
-//    dedicado, o Resend con dominio verificado).
-function senderMode(): "shared" | "peruser" {
-  return (process.env.EMAIL_SENDER_MODE || "shared").toLowerCase() === "peruser"
-    ? "peruser"
-    : "shared";
-}
-
-function buildFrom(sender: string | null): string | null {
-  const shared = process.env.GHL_EMAIL_FROM;
-  if (senderMode() === "peruser") return sender || shared || null;
-  if (!shared) return sender;
-  return sender ? `${displayName(sender)} (AI Lead Shield) <${shared}>` : shared;
-}
-
-// Quita acentos y pasa a minúsculas para comparar nombres.
-const fold = (s: string) =>
-  s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
-
-// Últimas líneas con texto del cuerpo HTML (donde suele ir la firma).
-function lastLines(html: string, n = 6): string[] {
-  return html
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, "&")
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .slice(-n);
-}
-
-// ¿El vendedor ya firmó con su nombre (completo o el de pila) al final?
-function signedBy(html: string, sender: string): boolean {
-  const tail = fold(lastLines(html).join("\n"));
-  const full = fold(displayName(sender));
-  if (full && tail.includes(full)) return true;
-  const first = full.split(" ")[0];
-  if (first.length < 3) return false;
-  const esc = first.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^\\p{L}])${esc}([^\\p{L}]|$)`, "u").test(tail);
-}
-
-// Con remitente compartido, el prospecto no ve el correo del vendedor, así que
-// se lo agregamos al pie para que pueda contestarle directo. Si el vendedor ya
-// puso su correo en el cuerpo, o ya firmó con su nombre, no duplicamos.
-function withSignature(html: string, sender: string | null): string {
-  if (senderMode() === "peruser" || !sender) return html;
-  if (html.toLowerCase().includes(sender.toLowerCase())) return html;
-  if (signedBy(html, sender)) return html;
-  return `${html}<p style="margin-top:16px">—<br/>${displayName(
-    sender
-  )} · AI Lead Shield<br/><a href="mailto:${sender}">${sender}</a></p>`;
+// Remitente: SIEMPRE el vendedor logueado, armado por la app al enviar
+// ("Aldo Perez (AI Lead Shield) <aldo@…>"). No hay dirección fija en variables
+// de entorno ni en el código; GHL debe tener ese buzón dado de alta.
+function buildFrom(sender: string): string {
+  return `${displayName(sender)} (AI Lead Shield) <${sender}>`;
 }
 
 // Todo correo debe decir cómo darse de baja. Si el cuerpo no menciona "BAJA"
@@ -99,11 +41,6 @@ const mentionsBaja = (s: string) => /(^|[^\p{L}])baja([^\p{L}]|$)/iu.test(s);
 function withBajaHtml(html: string): string {
   if (mentionsBaja(html)) return html;
   return `${html}<p style="margin-top:16px;font-size:12px;color:#94a3b8">${BAJA_LINE}</p>`;
-}
-
-function withBajaText(text: string | undefined): string | undefined {
-  if (!text || mentionsBaja(text)) return text;
-  return `${text}\n\n${BAJA_LINE}`;
 }
 
 // "2026-10-03T…" -> "3 de octubre de 2026" (hora de México).
@@ -125,19 +62,10 @@ function alreadyContactedMsg(p: OutreachEvent, sender: string | null): string {
   return `${who} a este correo el ${fecha(p.at)}${subj}. No se envió para no duplicar.`;
 }
 
-// Quién manda el correo: "ghl" | "resend" | "auto" (default).
-// En auto se usa GHL si está configurado, y si no se cae a Resend.
-function provider(): "ghl" | "resend" {
-  const want = (process.env.EMAIL_PROVIDER || "auto").toLowerCase();
-  if (want === "ghl") return "ghl";
-  if (want === "resend") return "resend";
-  return ghlEmailReady() ? "ghl" : "resend";
-}
-
 type SendResult =
   | {
       ok: true;
-      provider: "ghl" | "resend";
+      provider: "ghl";
       from: string;
       id?: string;
       conversationId?: string;
@@ -224,35 +152,20 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  let sent: SendResult;
-  if (provider() === "ghl") {
-    const from = buildFrom(sender);
-    if (!from) {
-      return NextResponse.json(
-        {
-          error:
-            "No hay remitente: inicia sesión de nuevo o define GHL_EMAIL_FROM.",
-        },
-        { status: 401 }
-      );
-    }
-    sent = await sendWithGhl({
-      to,
-      subject,
-      html: withBajaHtml(withSignature(body, sender)),
-      from,
-      name,
-      phone,
-    });
-  } else {
-    sent = await sendWithResend({
-      to,
-      subject,
-      html: withBajaHtml(body),
-      text: withBajaText(text),
-      sender,
-    });
+  if (!sender) {
+    return NextResponse.json(
+      { error: "No hay remitente: vuelve a iniciar sesión." },
+      { status: 401 }
+    );
   }
+  const sent = await sendWithGhl({
+    to,
+    subject,
+    html: withBajaHtml(body),
+    from: buildFrom(sender),
+    name,
+    phone,
+  });
 
   if (!sent.ok) {
     return NextResponse.json({ error: sent.error }, { status: sent.status });
@@ -291,7 +204,7 @@ async function recordSent(input: {
   sender: string | null;
   target: string;
   subject: string;
-  provider: "ghl" | "resend";
+  provider: "ghl";
   from: string;
   messageId?: string;
   leadId?: string;
@@ -402,10 +315,15 @@ async function sendWithGhl(input: {
           "El token de GHL no tiene el scope 'conversations/message.write'. Agrégalo en Ajustes → Private Integrations y vuelve a generar el token.",
       };
     }
+    // El remitente es el correo del vendedor: si GHL no lo tiene dado de alta,
+    // rechaza aquí.
+    const sender = input.from.match(/<([^>]+)>/)?.[1] ?? input.from;
     return {
       ok: false,
       status: 502,
-      error: `GHL rechazó el envío (HTTP ${r.status}). ${msg ?? ""}`.trim(),
+      error: `GHL rechazó el envío (HTTP ${r.status}). ${msg ?? ""} Revisa que ${sender} esté dado de alta como remitente en GHL.`
+        .replace(/\s+/g, " ")
+        .trim(),
     };
   }
 
@@ -438,64 +356,4 @@ async function sendWithGhl(input: {
     conversationId: b?.conversationId,
     contactId: contact.id,
   };
-}
-
-// --- Resend (respaldo) ---
-async function sendWithResend(input: {
-  to: string;
-  subject: string;
-  html: string;
-  text?: string;
-  sender?: string | null;
-}): Promise<SendResult> {
-  const apiKey = process.env.RESEND_API_KEY;
-  const fallback = process.env.RESEND_FROM; // ej. "Ventas <ventas@tudominio.com>"
-
-  if (!apiKey) {
-    return {
-      ok: false,
-      status: 503,
-      error: "Falta RESEND_API_KEY (o usa EMAIL_PROVIDER=ghl).",
-    };
-  }
-  if (!fallback) {
-    return {
-      ok: false,
-      status: 503,
-      error:
-        "Falta RESEND_FROM. Define el remitente verificado (ej. Ventas <ventas@tudominio.com>).",
-    };
-  }
-
-  // En "shared" se manda desde la dirección base con el nombre del vendedor.
-  // En "peruser" se usa su propio correo, pero solo si es del mismo dominio
-  // verificado en Resend; si no, Resend rechazaría el envío.
-  const domainOf = (s: string) => s.split("@")[1]?.replace(/>$/, "").toLowerCase();
-  const addrOf = (s: string) => s.match(/<([^>]+)>/)?.[1] ?? s;
-  let from = fallback;
-  if (input.sender) {
-    if (senderMode() === "shared") {
-      from = `${displayName(input.sender)} (AI Lead Shield) <${addrOf(fallback)}>`;
-    } else if (domainOf(input.sender) === domainOf(fallback)) {
-      from = `${displayName(input.sender)} <${input.sender}>`;
-    }
-  }
-
-  try {
-    const resend = new Resend(apiKey);
-    const { data, error } = await resend.emails.send({
-      from,
-      to: input.to,
-      subject: input.subject,
-      html: input.html,
-      text: input.text || undefined,
-    });
-    if (error) {
-      return { ok: false, status: 502, error: error.message };
-    }
-    return { ok: true, provider: "resend", from, id: data?.id };
-  } catch (err) {
-    console.error("send error", err);
-    return { ok: false, status: 500, error: "No se pudo enviar el correo." };
-  }
 }

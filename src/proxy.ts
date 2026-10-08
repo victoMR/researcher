@@ -5,6 +5,9 @@ import { verifySession, SESSION_COOKIE } from "@/lib/auth";
 
 // Rutas públicas (no requieren sesión).
 const PUBLIC = ["/login", "/api/auth/"];
+// Rutas con autenticación propia (coincidencia EXACTA): el servidor MCP valida
+// su propio Bearer token por vendedor (MCP_TOKENS) en vez de la cookie.
+const SELF_AUTH = new Set(["/api/mcp"]);
 
 export async function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
@@ -12,6 +15,7 @@ export async function proxy(req: NextRequest) {
   if (PUBLIC.some((p) => pathname === p || pathname.startsWith(p))) {
     return NextResponse.next();
   }
+  if (SELF_AUTH.has(pathname)) return NextResponse.next();
 
   const session = await verifySession(req.cookies.get(SESSION_COOKIE)?.value);
   if (session) return NextResponse.next();

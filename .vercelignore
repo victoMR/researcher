@@ -1,0 +1,8 @@
+# Nunca subir secretos locales al desplegar con la CLI (las variables van en
+# Vercel → Settings → Environment Variables; ver scripts/subir-env-vercel.mjs).
+.env*
+*.local
+.vercel
+node_modules
+.next
+coverage

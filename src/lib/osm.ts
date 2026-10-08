@@ -41,9 +41,16 @@ interface OverpassElement {
   tags?: Record<string, string>;
 }
 
-interface GeoPlace {
+export interface GeoPlace {
   displayName: string;
   bbox: [number, number, number, number]; // [south, north, west, east]
+  lat?: number; // centro del lugar
+  lon?: number;
+  kind?: string; // addresstype de Nominatim: city, town, suburb, state…
+  stateIso?: string; // ISO 3166-2, p. ej. "MX-QUE"
+  state?: string;
+  county?: string; // en México, el municipio
+  borough?: string; // en CDMX, la alcaldía
 }
 
 export interface OsmSearch {
@@ -119,8 +126,9 @@ function buildAddress(t: Record<string, string>): string | undefined {
 // Pedimos varios resultados y elegimos el que sea CIUDAD/municipio; así evitamos
 // que "Querétaro" se interprete como el ESTADO completo (bbox gigante = lento).
 // En modo general (global) no restringimos país; si no, sólo México.
+// También se usa para DENUE (centro, estado y municipio): ver geocodePlace().
 async function geocodeCity(city: string, global: boolean): Promise<GeoPlace> {
-  const key = ["geo", normalizeKeyPart(city), global ? "global" : "mx"].join("|");
+  const key = ["geo2", normalizeKeyPart(city), global ? "global" : "mx"].join("|");
   const hit = await getCached<GeoPlace>(key, GEO_TTL_MS);
   if (hit && Array.isArray(hit.data?.bbox) && hit.data.bbox.length === 4) {
     return hit.data;
@@ -148,10 +156,13 @@ async function geocodeCity(city: string, global: boolean): Promise<GeoPlace> {
     const geo = (await geoRes.json()) as Array<{
       boundingbox: [string, string, string, string];
       display_name: string;
+      lat?: string;
+      lon?: string;
       class?: string;
       type?: string;
       addresstype?: string;
       importance?: number;
+      address?: Record<string, string>;
     }>;
     if (!geo.length) {
       throw new OsmError(
@@ -184,13 +195,31 @@ async function geocodeCity(city: string, global: boolean): Promise<GeoPlace> {
 
     // boundingbox = [south, north, west, east]
     const [south, north, west, east] = best.boundingbox.map(Number);
+    const a = best.address ?? {};
+    const lat = Number(best.lat);
+    const lon = Number(best.lon);
     const place: GeoPlace = {
       displayName: best.display_name,
       bbox: [south, north, west, east],
+      lat: Number.isFinite(lat) ? lat : (south + north) / 2,
+      lon: Number.isFinite(lon) ? lon : (west + east) / 2,
+      kind: best.addresstype || best.type,
+      stateIso: a["ISO3166-2-lvl4"],
+      state: a.state,
+      county: a.county,
+      borough: a.borough,
     };
     await setCached(key, { source: "nominatim", city: place.displayName, data: place });
     return place;
   });
+}
+
+/**
+ * Geocodifica un lugar con Nominatim (solo México salvo `global`), con caché de
+ * 30 días: bbox, centro, estado (ISO) y municipio. Lanza OsmError.
+ */
+export function geocodePlace(city: string, opts: { global?: boolean } = {}): Promise<GeoPlace> {
+  return geocodeCity(city, !!opts.global);
 }
 
 function buildOverpassQuery(cat: Category, place: GeoPlace): string {
@@ -233,6 +262,7 @@ function toBusinesses(elements: OverpassElement[], cat: Category): Business[] {
       address: buildAddress(t),
       lat,
       lon,
+      source: "osm",
     });
   }
 

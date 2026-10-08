@@ -1,5 +1,7 @@
 // Utilidades de presentación, seguras en el cliente (sin dependencias de servidor).
 
+import type { DataSource } from "./types";
+
 // "aldo.perez@ialeadshield.com.mx" -> "Aldo Perez"
 export function personName(email: string): string {
   return email
@@ -50,10 +52,20 @@ export function isRecent(iso?: string): boolean {
   return Date.now() - Date.parse(iso) <= ACTIVE_WINDOW_MS;
 }
 
+// Colores alineados con scoreLabel(): Completo ≥ 9, Bueno ≥ 7, Incompleto ≥ 4, Pobre.
 export function scoreColor(score: number): string {
-  if (score >= 8) return "bg-emerald-100 text-emerald-700";
-  if (score >= 5) return "bg-amber-100 text-amber-700";
+  if (score >= 9) return "bg-emerald-100 text-emerald-700";
+  if (score >= 7) return "bg-teal-50 text-teal-700";
+  if (score >= 4) return "bg-amber-100 text-amber-700";
   return "bg-slate-100 text-slate-500";
+}
+
+// Leyenda de atribución según la fuente de los datos.
+export function sourceCredit(source: DataSource): string {
+  if (source === "denue") return "Datos: DENUE (INEGI)";
+  if (source === "osm") return "© OpenStreetMap contributors";
+  if (source === "web") return "Datos: sitio web del negocio";
+  return "Datos de Google Maps · solo consulta";
 }
 
 // Descarga un CSV (con BOM para que Excel respete los acentos).

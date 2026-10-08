@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
-import type { Lead, LeadStatus, Me, OwnerFilter } from "@/lib/types";
-import { LEAD_STATUSES } from "@/lib/types";
+import type { DataSource, Lead, LeadStatus, Me, OwnerFilter } from "@/lib/types";
+import { LEAD_STATUSES, isGoogleOnly, sourceOf } from "@/lib/types";
 import {
   deleteLead,
   fetchAllLeads,
+  linkDenue,
   patchLead,
   suppressEmail,
   useLeadList,
@@ -35,6 +36,13 @@ export const DEFAULT_PROSPECT_FILTERS: ProspectFilters = {
   view: "lista",
 };
 
+// Aviso de lo que no se exporta por los términos de Google.
+export function googleSkipNote(n: number): string {
+  return n === 1
+    ? "1 de Google no se exporta por sus términos; vincúlalo con DENUE."
+    : `${n} de Google no se exportan por sus términos; vincúlalas con DENUE.`;
+}
+
 // Sube prospectos a GHL en tandas (para no topar el tiempo de la función).
 async function pushToGhl(
   list: Lead[],
@@ -43,6 +51,7 @@ async function pushToGhl(
   let pushed = 0;
   let skipped = 0;
   let failed = 0;
+  let google = 0;
   const CHUNK = 50;
   for (let i = 0; i < list.length; i += CHUNK) {
     const res = await fetch("/api/ghl/contacts", {
@@ -58,13 +67,15 @@ async function pushToGhl(
     pushed += d.pushed ?? 0;
     skipped += d.skipped ?? 0;
     failed += d.failed ?? 0;
+    google += d.googleSkipped ?? 0;
     onProgress?.(Math.min(i + CHUNK, list.length), list.length);
   }
   return (
     `GHL: ${pushed} contacto(s) enviados` +
     (skipped ? `, ${skipped} sin correo/teléfono` : "") +
     (failed ? `, ${failed} con error` : "") +
-    "."
+    "." +
+    (google ? " " + googleSkipNote(google) : "")
   );
 }
 
@@ -80,11 +91,18 @@ const CSV_HEADER = [
   "Correo",
   "Teléfono",
   "Web",
-  "Rating",
-  "Reseñas",
   "Dirección",
   "Nota",
+  "Fuente",
 ];
+
+// Atribución por fila (INEGI pide citar la fuente).
+const CSV_SOURCE: Record<DataSource, string> = {
+  denue: "INEGI, DENUE",
+  osm: "© OpenStreetMap contributors",
+  google: "",
+  web: "Sitio web del negocio",
+};
 
 function csvRow(l: Lead) {
   return [
@@ -99,10 +117,9 @@ function csvRow(l: Lead) {
     l.email,
     l.phone,
     l.website,
-    l.rating,
-    l.reviewCount,
     l.address,
     l.note,
+    l.denueId ? CSV_SOURCE.denue : CSV_SOURCE[sourceOf(l)],
   ];
 }
 
@@ -128,6 +145,8 @@ export default function Prospects({
   const [qInput, setQInput] = useState(filters.q);
   const [localKey, setLocalKey] = useState(0);
   const [busy, setBusy] = useState<Busy>(null);
+  // Aviso tras exportar (p. ej. cuántos de Google se omitieron).
+  const [exportNote, setExportNote] = useState<string | null>(null);
   const reload = () => setLocalKey((k) => k + 1);
 
   // Buscador con debounce (~300 ms).
@@ -259,11 +278,21 @@ export default function Prospects({
   }
 
   async function ghlOne(l: Lead) {
+    if (isGoogleOnly(l)) return fail(googleSkipNote(1));
     try {
       alert(await pushToGhl([l]));
     } catch (e) {
       fail((e as Error).message);
     }
+  }
+
+  // Solo-Google -> busca el mismo negocio en DENUE y completa sus datos.
+  async function linkOne(l: Lead) {
+    const r = await linkDenue(l.id);
+    if (!r.ok) return fail(r.error);
+    if (r.lead) patchLocal(l.id, r.lead);
+    if (!r.matched) alert(r.message || "No encontré este negocio en DENUE.");
+    else afterChange();
   }
 
   /* ---------- Acciones sobre todo el filtro ---------- */
@@ -275,7 +304,15 @@ export default function Prospects({
       const all = await fetchAllLeads(listFilters, (done, t) =>
         setBusy({ kind: "csv", done, total: t })
       );
-      downloadCSV("prospectos.csv", CSV_HEADER, all.map(csvRow));
+      // Términos de Google: sus filas no se exportan.
+      const rows = all.filter((l) => !isGoogleOnly(l));
+      const google = all.length - rows.length;
+      if (rows.length) downloadCSV("prospectos.csv", CSV_HEADER, rows.map(csvRow));
+      setExportNote(
+        google
+          ? (rows.length ? "" : "No hay nada que exportar. ") + googleSkipNote(google)
+          : null
+      );
     } catch (e) {
       fail((e as Error).message);
     } finally {
@@ -289,16 +326,27 @@ export default function Prospects({
     setBusy({ kind: "ghl", done: 0, total });
     try {
       const all = await fetchAllLeads(listFilters);
-      // Solo los que puedo trabajar (los de otro vendedor se saltan).
-      const mineToo = all.filter((l) => canEditLead(l, me));
-      const others = all.length - mineToo.length;
+      // Solo los que puedo trabajar (los de otro vendedor se saltan) y sin
+      // contenido de Google (sus términos no permiten exportarlo).
+      const google = all.filter((l) => isGoogleOnly(l)).length;
+      const open = all.filter((l) => !isGoogleOnly(l));
+      const mineToo = open.filter((l) => canEditLead(l, me));
+      const others = open.length - mineToo.length;
       if (!mineToo.length) {
-        fail("Todos los prospectos de este filtro los trabaja otro vendedor.");
+        fail(
+          google && !open.length
+            ? `No hay nada que enviar. ${googleSkipNote(google)}`
+            : "Todos los prospectos de este filtro los trabaja otro vendedor."
+        );
         return;
       }
       setBusy({ kind: "ghl", done: 0, total: mineToo.length });
       const msg = await pushToGhl(mineToo, (done, t) => setBusy({ kind: "ghl", done, total: t }));
-      alert(msg + (others ? ` Se omitieron ${others} de otros vendedores.` : ""));
+      alert(
+        msg +
+          (others ? ` Se omitieron ${others} de otros vendedores.` : "") +
+          (google ? " " + googleSkipNote(google) : "")
+      );
     } catch (e) {
       fail((e as Error).message);
     } finally {
@@ -426,6 +474,19 @@ export default function Prospects({
         </p>
       )}
 
+      {exportNote && (
+        <div className="mb-4 flex items-start justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          <span>{exportNote}</span>
+          <button
+            onClick={() => setExportNote(null)}
+            title="Cerrar aviso"
+            className="grid h-6 w-6 shrink-0 place-items-center rounded-full text-amber-700 hover:bg-amber-100"
+          >
+            <Icon.X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Primera carga */}
       {!data && loading && (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -462,6 +523,7 @@ export default function Prospects({
               onRemove={() => remove(l)}
               onCompose={() => onCompose(l)}
               onGhl={() => ghlOne(l)}
+              onLinkDenue={() => linkOne(l)}
             />
           ))}
         </div>

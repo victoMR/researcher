@@ -13,6 +13,11 @@ interface Props {
   lead: Business;
   onClose: () => void;
   onSent?: (r: { leadId?: string }) => void;
+  // Opcionales (p. ej. el mensaje sugerido por el agente de IA): si vienen,
+  // reemplazan el asunto / cuerpo por defecto. Al cuerpo se le agregan igual
+  // la firma del vendedor y la línea de BAJA.
+  initialSubject?: string;
+  initialBody?: string;
 }
 
 // Vendedor logueado (GET /api/auth/me).
@@ -33,14 +38,32 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const norm = (e: string) => e.trim().toLowerCase();
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
+const BAJA_FOOTER =
+  'Si prefiere no recibir más correos, responda "BAJA" y lo retiramos de inmediato.';
+
 // Firma con el vendedor real; sin `me` (cargando o sin sesión) no se nombra a nadie.
-function defaultTemplate(name: string, me: Me | null) {
+// Con `initial` (asunto/cuerpo propuestos) se usan esos textos + firma + BAJA.
+function defaultTemplate(
+  name: string,
+  me: Me | null,
+  initial?: { subject?: string; body?: string }
+) {
   const intro = me
     ? `Soy ${me.name}, de AI Lead Shield.`
     : "Le escribo de AI Lead Shield.";
   const firma = me ? `${me.name}\nAI Lead Shield\n${me.email}` : "AI Lead Shield";
+  const initialBody = initial?.body?.trim();
+  if (initialBody) {
+    // Si el texto ya se despide, no repetimos "Saludos,".
+    const closes = /(saludos|atentamente|quedo atent[oa])[^\n]*\s*$/i.test(initialBody);
+    const baja = /(^|[^\p{L}])baja([^\p{L}]|$)/iu.test(initialBody);
+    return {
+      subject: initial?.subject?.trim() || `Propuesta para ${name}`,
+      body: `${initialBody}\n\n${closes ? "" : "Saludos,\n"}${firma}${baja ? "" : `\n\n--\n${BAJA_FOOTER}`}`,
+    };
+  }
   return {
-    subject: `Propuesta para ${name}`,
+    subject: initial?.subject?.trim() || `Propuesta para ${name}`,
     body: `Hola, equipo de ${name}:
 
 ${intro} Ayudamos a negocios como el suyo a conseguir más clientes con automatización e inteligencia artificial aplicada a ventas.
@@ -106,15 +129,25 @@ function EventIcon({ type }: { type: string }) {
   return <Icon.Refresh className={`${cls} text-slate-400`} />;
 }
 
-export default function ComposeModal({ lead, onClose, onSent }: Props) {
+export default function ComposeModal({
+  lead,
+  onClose,
+  onSent,
+  initialSubject,
+  initialBody,
+}: Props) {
   const [me, setMe] = useState<Me | null>(null);
   const [meReady, setMeReady] = useState(false);
   // Si el usuario ya tocó el mensaje, no lo reescribimos al llegar `me`.
   const bodyEdited = useRef(false);
 
   const [to, setTo] = useState(lead.email || "");
-  const [subject, setSubject] = useState(() => defaultTemplate(lead.name, null).subject);
-  const [body, setBody] = useState(() => defaultTemplate(lead.name, null).body);
+  const [subject, setSubject] = useState(
+    () => defaultTemplate(lead.name, null, { subject: initialSubject }).subject
+  );
+  const [body, setBody] = useState(
+    () => defaultTemplate(lead.name, null, { body: initialBody }).body
+  );
   const [sending, setSending] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [msgOk, setMsgOk] = useState(false);
@@ -149,11 +182,12 @@ export default function ComposeModal({ lead, onClose, onSent }: Props) {
       .then((d: Me | null) => {
         if (!d?.name) return;
         setMe(d);
-        if (!bodyEdited.current) setBody(defaultTemplate(lead.name, d).body);
+        if (!bodyEdited.current)
+          setBody(defaultTemplate(lead.name, d, { body: initialBody }).body);
       })
       .catch(() => {})
       .finally(() => setMeReady(true));
-  }, [lead.name]);
+  }, [lead.name, initialBody]);
 
   // Al abrir y al cambiar "Para" (con espera de 400 ms): ¿pidió BAJA? y
   // ¿quién le ha escrito ya?

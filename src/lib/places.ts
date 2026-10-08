@@ -202,8 +202,12 @@ export async function searchPlacesPage(
     if (p.businessStatus === "CLOSED_PERMANENTLY") continue;
     seen.add(p.id);
     const review = latestReview(p.reviews);
+    // Solo para mostrar en vivo: al guardar, leads-repo se queda con place_id
+    // (o lo vincula con DENUE). No se exporta ni se pinta en mapas que no son de Google.
     out.push({
       id: `place/${p.id}`,
+      source: "google",
+      placeId: p.id,
       name: p.displayName.text,
       category: cat.label,
       phone: p.nationalPhoneNumber || p.internationalPhoneNumber,

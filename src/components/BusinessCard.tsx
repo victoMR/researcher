@@ -1,10 +1,82 @@
 "use client";
 
+import { useId, useState } from "react";
 import type { Business, LeadMatch, Me } from "@/lib/types";
+import { googleMapsUrl, isGoogleOnly, placeIdOf, sourceOf } from "@/lib/types";
 import { buildWaText, logWhatsApp, waLink } from "@/lib/wa";
-import { firstName, isRecent, personName, scoreColor, shortDate, timeAgo } from "@/lib/format";
+import {
+  firstName,
+  isRecent,
+  personName,
+  scoreColor,
+  shortDate,
+  sourceCredit,
+  timeAgo,
+} from "@/lib/format";
+import { formatBreakdown, scoreLabel } from "@/lib/scoring";
 import { CardShell } from "@/components/ui";
 import * as Icon from "@/components/icons";
+
+// Etiqueta del score (Completo/Bueno/Incompleto/Pobre) + "¿Por qué N?" con el
+// desglose por resta: "10 − 3 (sin correo) − 1 (sin sitio web) = 6".
+export function ScoreBadge({
+  score,
+  deductions,
+}: {
+  score: number;
+  deductions?: { points: number; reason: string }[];
+}) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  const list = deductions ?? [];
+  const label = scoreLabel(score);
+  const text = formatBreakdown({ score, max: 10, deductions: list, label });
+  return (
+    <div className="mt-1">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span
+          className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${scoreColor(score)}`}
+          title={text}
+        >
+          {label}
+        </span>
+        {list.length > 0 ? (
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            aria-controls={id}
+            title={text}
+            className="flex items-center gap-0.5 rounded-md px-1 text-[11px] font-medium text-indigo-600 hover:underline"
+          >
+            ¿Por qué {score}?
+            <Icon.ChevronRight className={`h-3 w-3 transition ${open ? "rotate-90" : ""}`} />
+          </button>
+        ) : (
+          <span className="text-[11px] text-emerald-700">Datos completos y activo</span>
+        )}
+      </div>
+      {open && list.length > 0 && (
+        <div
+          id={id}
+          className="mt-1.5 rounded-xl border border-black/5 bg-slate-50 px-3 py-2 text-[11px] text-slate-600"
+        >
+          <p className="font-medium tabular-nums text-slate-800">{text}</p>
+          <ul className="mt-1 space-y-0.5">
+            {list.map((d, i) => (
+              <li key={`${d.reason}-${i}`} className="flex gap-2">
+                <span className="w-5 shrink-0 text-right font-semibold tabular-nums text-rose-600">
+                  −{-d.points}
+                </span>
+                <span>{d.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Tarjeta de un resultado de búsqueda. Muestra si ya está guardado y con quién
 // para que dos vendedores no le escriban al mismo negocio.
@@ -42,6 +114,9 @@ export default function BusinessCard({
   )}`;
   const wa = b.phone ? waLink(b.phone, buildWaText(b, waTemplateBody, me?.name)) : null;
   const recent = isRecent(b.lastReviewTime);
+  const src = sourceOf(b);
+  const google = isGoogleOnly(b);
+  const placeId = placeIdOf(b);
 
   const owner = match?.ownerEmail ?? null;
   const mine = !!owner && owner === me?.email;
@@ -58,18 +133,26 @@ export default function BusinessCard({
   return (
     <CardShell>
       <div className="flex items-start justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 items-start gap-2">
           {b.score != null && (
             <span
               className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg text-sm font-bold ${scoreColor(b.score)}`}
-              title="Calificación de prospecto (1–10): calidad de reseñas, actividad reciente y facilidad de contacto"
+              title={`Calificación de prospecto (1–10, por resta): ${formatBreakdown({
+                score: b.score,
+                max: 10,
+                deductions: b.scoreDeductions ?? [],
+                label: scoreLabel(b.score),
+              })}`}
             >
               {b.score}
             </span>
           )}
-          <h3 className="truncate font-semibold text-slate-900" title={b.name}>
-            {b.name}
-          </h3>
+          <div className="min-w-0">
+            <h3 className="truncate font-semibold text-slate-900" title={b.name}>
+              {b.name}
+            </h3>
+            {b.score != null && <ScoreBadge score={b.score} deductions={b.scoreDeductions} />}
+          </div>
         </div>
         {b.lastReviewAgo && (
           <span
@@ -85,17 +168,49 @@ export default function BusinessCard({
           </span>
         )}
       </div>
+      {/* Rating y reseñas: contenido de Google, con su etiqueta y enlace a su ficha */}
       {(b.rating != null || b.reviewCount != null) && (
-        <div className="mt-1 flex items-center gap-1 text-xs text-slate-500">
+        <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-slate-500">
+          <span className="rounded bg-slate-100 px-1 py-px text-[10px] font-semibold text-slate-500">
+            Google
+          </span>
           <Icon.Star className="h-3.5 w-3.5 text-amber-500" />
           <span className="font-medium text-slate-700">
             {b.rating?.toFixed(1) ?? "—"}
           </span>
           {b.reviewCount != null && <span>({b.reviewCount} reseñas)</span>}
+          {placeId && (
+            <a
+              href={googleMapsUrl(placeId)}
+              target="_blank"
+              rel="noreferrer"
+              className="ml-1 flex items-center gap-0.5 font-medium text-indigo-600 hover:underline"
+            >
+              Ver en Google Maps <Icon.ExternalLink className="h-3 w-3" />
+            </a>
+          )}
         </div>
+      )}
+      {google && placeId && b.rating == null && b.reviewCount == null && (
+        <a
+          href={googleMapsUrl(placeId)}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-1 flex items-center gap-0.5 text-xs font-medium text-indigo-600 hover:underline"
+        >
+          Ver en Google Maps <Icon.ExternalLink className="h-3 w-3" />
+        </a>
       )}
       {b.address && (
         <p className="mt-0.5 line-clamp-2 text-xs text-slate-400">{b.address}</p>
+      )}
+      {b.employees && (
+        <p
+          className="mt-0.5 flex items-center gap-1 text-xs text-slate-500"
+          title="Personal ocupado (DENUE)"
+        >
+          <Icon.Users className="h-3.5 w-3.5 text-slate-400" /> {b.employees}
+        </p>
       )}
 
       {/* Ya lo contactó alguien / está descartado */}
@@ -281,6 +396,17 @@ export default function BusinessCard({
           Propuesta
         </button>
       </div>
+      {/* Atribución de la fuente */}
+      <p
+        className="mt-2 text-[10px] text-slate-400"
+        title={
+          google
+            ? "Contenido de Google: solo para consultar. Al guardarlo se vincula con DENUE o se guarda lo mínimo; no se exporta."
+            : undefined
+        }
+      >
+        {sourceCredit(src)}
+      </p>
     </CardShell>
   );
 }

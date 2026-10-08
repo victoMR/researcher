@@ -71,6 +71,7 @@ env.set("APP_ADMINS", (admins.filter(Boolean).length ? admins : [emails[0]]).joi
 env.set("MCP_TOKENS", users.map((u) => `${u.email}:${u.mcp}`).join(","));
 // Llaves de servicios: .env.local es la fuente (ahí las mantiene el equipo).
 const SERVICE_KEYS = [
+  "DATABASE_URL",
   "DENUE_TOKEN",
   "GOOGLE_PLACES_API_KEY",
   "GHL_PIT",
@@ -110,7 +111,7 @@ console.log(`Listo: ${users.length} usuario(s): ${emails.join(", ")}`);
 console.log(`Admin: ${env.get("APP_ADMINS")}`);
 console.log("Variables -> .env.production.local · Contraseñas y tokens -> .env.vendedores.local");
 if (copied.length) console.log(`Copiadas de .env.local: ${copied.join(", ")}`);
-const missing = ["GHL_PIT", "GHL_LOCATION_ID", "ANTHROPIC_API_KEY", "DENUE_TOKEN"].filter(
+const missing = ["DATABASE_URL", "GHL_PIT", "GHL_LOCATION_ID", "ANTHROPIC_API_KEY", "DENUE_TOKEN"].filter(
   (k) => !env.get(k)
 );
 if (missing.length) console.log(`Faltan: ${missing.join(", ")} (agrégalas a .env.local y vuelve a correr, o directo en .env.production.local)`);

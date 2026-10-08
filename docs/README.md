@@ -8,6 +8,8 @@ Plan y referencia para pasar de "listas y CSV" a **prospección viva en todo Mé
 | [tiempo-real-y-arquitectura.md](tiempo-real-y-arquitectura.md) | Qué significa "tiempo real", catálogo de señales, enriquecimiento con Claude y costos, arquitectura (cola, PostGIS/H3, feed, alertas), mapa nacional y roadmap con KPIs |
 | [mcp.md](mcp.md) | Servidor MCP de la app: cómo conectarlo a Claude Code/Desktop y herramientas disponibles |
 
+> La base de datos es **Supabase** (Postgres) vía postgres.js. Donde los documentos de investigación dicen "Neon", aplica igual a Supabase, que también soporta PostGIS.
+
 ## Lo que ya está construido
 
 ### Investigar con IA (pestaña principal)
@@ -68,7 +70,8 @@ Para limpiar los datos de Google guardados antes de este cambio existe `POST /ap
 
 | Variable | Para qué | Requerida |
 |---|---|---|
-| `DATABASE_URL` | Neon Postgres (las tablas se crean solas) | Sí |
+| `DATABASE_URL` | Postgres de **Supabase**: cadena del *Transaction pooler* (puerto 6543), en Project Settings → Database → Connection string. También sirve `POSTGRES_URL` si se conecta con la integración de Supabase en Vercel. Las tablas se crean solas con RLS activo (la API pública de Supabase no las ve). Si ya existe una tabla con el mismo nombre que no es de esta app, se detiene sin modificar nada: conviene un proyecto de Supabase **dedicado** | Sí |
+| `DB_POOL_MAX` | Conexiones por instancia (3) | No |
 | `AUTH_SECRET` | Firma de sesiones, ≥ 32 caracteres. Generar: `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` | Sí (en producción) |
 | `APP_LOGIN_EMAIL` + `APP_LOGIN_PASSWORD` o `APP_USERS` | Usuarios (`correo:clave,correo2:clave2`); acepta hashes `scrypt:<salt>:<hash>` | Sí |
 | `APP_ADMINS` | Correos admin, separados por coma (si falta, el admin es `APP_LOGIN_EMAIL`) | No |

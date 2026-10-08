@@ -1,28 +1,100 @@
-import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
+import postgres from "postgres";
 export { dedupeKey } from "./dedupe";
 
-// Cliente Neon con init perezosa: no truena en build si aún no hay DATABASE_URL.
-let _sql: NeonQueryFunction<false, false> | null = null;
+// Postgres de Supabase vía postgres.js. Init perezosa: no truena en build si
+// aún no hay URL. Usa la cadena del "Transaction pooler" de Supabase (puerto
+// 6543): DATABASE_URL, o POSTGRES_URL si se conectó con la integración de
+// Supabase en Vercel.
+type Sql = postgres.Sql;
+let _sql: Sql | null = null;
 
-export function getSql(): NeonQueryFunction<false, false> {
+function dbUrl(): string | undefined {
+  return process.env.DATABASE_URL || process.env.POSTGRES_URL;
+}
+
+export function getSql(): Sql {
   if (!_sql) {
-    const url = process.env.DATABASE_URL;
-    if (!url) throw new Error("Falta DATABASE_URL (provisiona Neon).");
-    _sql = neon(url);
+    const url = dbUrl();
+    if (!url) throw new Error("Falta DATABASE_URL (cadena de conexión de Supabase).");
+    _sql = postgres(url, {
+      prepare: false, // el pooler en modo transacción no admite prepared statements
+      max: Number(process.env.DB_POOL_MAX) || 3, // pocas por instancia: el pooler reparte
+      idle_timeout: 20,
+      connect_timeout: 10,
+      ssl: /localhost|127\.0\.0\.1/.test(url) ? false : "require",
+      transform: { undefined: null }, // como el driver anterior: undefined -> NULL
+      types: {
+        // El código ya manda JSON serializado (JSON.stringify(...)::jsonb). El
+        // serializador por defecto lo volvería a convertir y quedaría guardado
+        // como texto: solo convertimos lo que no sea string.
+        json: {
+          to: 114,
+          from: [114, 3802],
+          serialize: (x: unknown) => (typeof x === "string" ? x : JSON.stringify(x)),
+          parse: (x: string) => JSON.parse(x),
+        },
+      },
+      onnotice: () => {}, // sin ruido por "ya existe" en los CREATE IF NOT EXISTS
+    });
   }
   return _sql;
 }
 
 export function hasDb(): boolean {
-  return !!process.env.DATABASE_URL;
+  return !!dbUrl();
 }
 
-let schemaReady = false;
+// Tablas de esta app y una columna que solo tienen las nuestras. Si en la base
+// ya existe una tabla con ese nombre SIN esa columna (p. ej. de Finanzas en el
+// mismo proyecto de Supabase), no tocamos nada.
+const OWN_TABLES: Record<string, string> = {
+  leads: "dedupe_key",
+  campaigns: "from_email",
+  campaign_recipients: "unsub_token",
+  suppression: "reason",
+  templates: "channel",
+  template_versions: "template_id",
+  events: "recipient_id",
+  search_cache: "results",
+  api_usage: "calls",
+  login_attempts: "ok",
+  research_runs: "prompt",
+  mcp_evidence: "businesses",
+};
 
-// Crea las tablas si no existen. Se llama antes de operar.
-export async function ensureSchema(): Promise<void> {
-  if (schemaReady) return;
-  const sql = getSql();
+async function assertNoForeignTables(sql: Sql): Promise<void> {
+  const rows = await sql<{ table_name: string; cols: string[] }[]>`
+    SELECT table_name, array_agg(column_name::text) AS cols
+    FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = ANY(${Object.keys(OWN_TABLES)}::text[])
+    GROUP BY table_name
+  `;
+  const foreign = rows.filter((r) => !r.cols.includes(OWN_TABLES[r.table_name]));
+  if (foreign.length) {
+    throw new Error(
+      `La base ya tiene tablas que no son de esta app: ${foreign
+        .map((r) => r.table_name)
+        .join(", ")}. Usa un proyecto de Supabase dedicado (no se modificó nada).`
+    );
+  }
+}
+
+let schemaPromise: Promise<void> | null = null;
+
+// Crea/actualiza las tablas una vez por instancia (llamadas simultáneas
+// comparten la misma promesa). Se llama antes de operar.
+export function ensureSchema(): Promise<void> {
+  if (!schemaPromise) {
+    schemaPromise = migrate(getSql()).catch((e) => {
+      schemaPromise = null; // reintenta en la siguiente llamada
+      throw e;
+    });
+  }
+  return schemaPromise;
+}
+
+async function migrate(sql: Sql): Promise<void> {
+  await assertNoForeignTables(sql);
 
   // Prospectos guardados (persistencia + dedupe).
   // dedupe_key = nombre normalizado + ciudad -> índice único para no duplicar.
@@ -231,5 +303,9 @@ export async function ensureSchema(): Promise<void> {
     )
   `;
 
-  schemaReady = true;
+  // Supabase publica el esquema por su API REST: con RLS activo y sin
+  // políticas, esa API no ve nada; la app (dueña de las tablas) sí.
+  for (const t of Object.keys(OWN_TABLES)) {
+    await sql`ALTER TABLE ${sql(t)} ENABLE ROW LEVEL SECURITY`;
+  }
 }

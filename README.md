@@ -21,7 +21,7 @@ npm install
 npm run dev
 ```
 
-Necesita al menos `DATABASE_URL`, `AUTH_SECRET` y un usuario (`APP_LOGIN_EMAIL` y `APP_LOGIN_PASSWORD`). La lista completa de variables está en [docs/README.md](docs/README.md#variables-de-entorno).
+Necesita al menos `DATABASE_URL` (Postgres de Supabase), `AUTH_SECRET` y un usuario (`APP_LOGIN_EMAIL` y `APP_LOGIN_PASSWORD`). La lista completa de variables está en [docs/README.md](docs/README.md#variables-de-entorno).
 
 ## Documentación
 
@@ -37,4 +37,4 @@ Necesita al menos `DATABASE_URL`, `AUTH_SECRET` y un usuario (`APP_LOGIN_EMAIL` 
 
 ## Stack
 
-Next.js 16 (App Router) · TypeScript · Tailwind 4 · Neon Postgres · Claude API · GoHighLevel · Leaflet · DENUE (INEGI) · OpenStreetMap.
+Next.js 16 (App Router) · TypeScript · Tailwind 4 · Supabase (Postgres) · Claude API · GoHighLevel · Leaflet · DENUE (INEGI) · OpenStreetMap.

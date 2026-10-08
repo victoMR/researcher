@@ -10,6 +10,7 @@ import type {
   OwnerFilter,
 } from "./types";
 import { dedupeKey } from "./dedupe";
+import { contactSelToParams, type ContactFilterSel } from "./contact-filters";
 
 /* ---------- Llamadas a la API (cliente) ---------- */
 
@@ -135,6 +136,7 @@ export interface LeadFilters {
   q: string;
   status: LeadStatus | null;
   owner: OwnerFilter;
+  contact?: ContactFilterSel; // chips "Con correo", "Con teléfono"... (Y)
 }
 
 function leadsQuery(f: LeadFilters, page: number, pageSize: number): string {
@@ -142,6 +144,7 @@ function leadsQuery(f: LeadFilters, page: number, pageSize: number): string {
   if (f.q) p.set("q", f.q);
   if (f.status) p.set("status", f.status);
   p.set("owner", f.owner);
+  contactSelToParams(f.contact, p);
   p.set("page", String(page));
   p.set("pageSize", String(pageSize));
   return `/api/leads?${p.toString()}`;
@@ -234,7 +237,17 @@ export function useSavedMatches(meEmail?: string | null) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             keys: list.map((b) => dedupeKey(b.name, b.city)),
-            ids: list.map((b) => b.id),
+            // También place/<placeId> y denue/<denueId>: una tarjeta unida
+            // (DENUE + Google) debe reconocer lo guardado antes con el otro id.
+            ids: [
+              ...new Set(
+                list.flatMap((b) => [
+                  b.id,
+                  ...(b.placeId ? [`place/${b.placeId}`] : []),
+                  ...(b.denueId ? [`denue/${b.denueId}`] : []),
+                ])
+              ),
+            ],
           }),
         });
         const d = (await res.json()) as { matches?: LeadMatch[] };
@@ -257,7 +270,10 @@ export function useSavedMatches(meEmail?: string | null) {
 
   const matchFor = useCallback(
     (b: Business): LeadMatch | undefined =>
-      map[kId(b.id)] ?? map[kKey(dedupeKey(b.name, b.city))],
+      map[kId(b.id)] ??
+      (b.placeId ? map[kId(`place/${b.placeId}`)] : undefined) ??
+      (b.denueId ? map[kId(`denue/${b.denueId}`)] : undefined) ??
+      map[kKey(dedupeKey(b.name, b.city))],
     [map]
   );
 
@@ -351,7 +367,11 @@ export function useLeadList(
   f: LeadFilters & { page: number; pageSize: number },
   refreshKey: string | number
 ) {
-  const url = leadsQuery({ q: f.q, status: f.status, owner: f.owner }, f.page, f.pageSize);
+  const url = leadsQuery(
+    { q: f.q, status: f.status, owner: f.owner, contact: f.contact },
+    f.page,
+    f.pageSize
+  );
   const reqKey = `${url}#${refreshKey}`;
   const [state, setState] = useState<ListState>({ key: "", data: null, error: null });
 

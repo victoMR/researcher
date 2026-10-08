@@ -3,6 +3,7 @@ import { hasDb } from "@/lib/db";
 import { listLeads, saveLead, clearLeads } from "@/lib/leads-repo";
 import { isAdmin, sessionEmail } from "@/lib/session";
 import { LEAD_STATUSES } from "@/lib/types";
+import { parseContactParams } from "@/lib/contact-filters";
 import type { Business, LeadStatus, OwnerFilter } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -19,7 +20,9 @@ function noDb() {
 const OWNERS: OwnerFilter[] = ["mine", "all", "unassigned"];
 
 // Lista paginada: ?q=&status=&owner=mine|all|unassigned&page=&pageSize=
-// pageSize=0 devuelve solo los conteos.
+// Filtros de contacto (Y): has_email=1, has_phone=1, has_website=1,
+// has_whatsapp=1 (teléfono MX válido), min_score=1..10. Criterio en
+// src/lib/contact-filters.ts. pageSize=0 devuelve solo los conteos.
 export async function GET(req: NextRequest) {
   if (!hasDb()) return noDb();
   try {
@@ -36,6 +39,7 @@ export async function GET(req: NextRequest) {
       me,
       page: Number.isFinite(page) ? page : 1,
       pageSize: Number.isFinite(pageSize) ? pageSize : 30,
+      contact: parseContactParams(p),
     });
     return NextResponse.json(data);
   } catch (e) {

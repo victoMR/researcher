@@ -61,6 +61,47 @@ export function CardShell({ children }: { children: React.ReactNode }) {
   );
 }
 
+// Chip de filtro que se prende/apaga (aria-pressed), con conteo opcional.
+export function FilterChip({
+  active,
+  label,
+  count,
+  icon,
+  title,
+  onClick,
+}: {
+  active: boolean;
+  label: React.ReactNode;
+  count?: number;
+  icon?: React.ReactNode;
+  title?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      title={title}
+      onClick={onClick}
+      className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-1 ${
+        active
+          ? "bg-indigo-600 text-white shadow-apple-sm"
+          : "border border-black/10 bg-white text-slate-600 hover:bg-slate-50"
+      }`}
+    >
+      {icon && (
+        <span aria-hidden className={`flex ${active ? "text-white" : "text-slate-400"}`}>
+          {icon}
+        </span>
+      )}
+      {label}
+      {count != null && (
+        <span className={`tabular-nums ${active ? "text-white/80" : "text-slate-400"}`}>{count}</span>
+      )}
+    </button>
+  );
+}
+
 // Interruptor segmentado (Lista/Mapa, Míos/Todos...).
 export function Segmented<T extends string>({
   value,

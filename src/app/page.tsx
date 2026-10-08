@@ -4,10 +4,28 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Template } from "@/lib/templates-repo";
 import { CATEGORIES, getCategory } from "@/lib/categories";
 import type { Business, LeadMatch, Me, SearchResponse } from "@/lib/types";
-import { hasCoords, isGoogleOnly, sourceOf } from "@/lib/types";
+import {
+  applyPage,
+  hasCoords,
+  isGoogleOnly,
+  knownOf,
+  sourceOf,
+  withoutGoogleLive,
+  type KnownResult,
+} from "@/lib/types";
 import { useSavedMatches } from "@/lib/useLeads";
 import { downloadCSV, isRecent, shortDate, sourceCredit, timeAgo } from "@/lib/format";
 import { computeScore } from "@/lib/scoring";
+import {
+  SEARCH_FILTER_KEYS,
+  activeKeys,
+  applyContactFilters,
+  loadContactSel,
+  saveContactSel,
+  webHasWhatsapp,
+  type ContactFilterSel,
+} from "@/lib/contact-filters";
+import ContactFilters from "@/components/ContactFilters";
 import ComposeModal from "@/components/ComposeModal";
 import StatusTicker from "@/components/StatusTicker";
 import Select from "@/components/Select";
@@ -77,9 +95,10 @@ function distanceKm(
 type Tab = "investigar" | "buscar" | "prospectos" | "plantillas" | "metricas";
 const TABS: Tab[] = ["investigar", "buscar", "prospectos", "plantillas", "metricas"];
 type View = "lista" | "mapa";
-// denue = México con DENUE (base, se guarda/exporta); google = solo consulta;
-// general = mundial con OpenStreetMap (gratis).
-type SearchMode = "denue" | "google" | "general";
+// mixta = DENUE + Google unidos (lo de DENUE se guarda/exporta, lo de Google es
+// solo consulta); denue = México con DENUE (base, se guarda/exporta);
+// google = solo consulta; general = mundial con OpenStreetMap (gratis).
+type SearchMode = "mixta" | "denue" | "google" | "general";
 
 // Última búsqueda mostrada (para "Cargar más" y "Actualizar").
 interface SearchQuery {
@@ -88,11 +107,14 @@ interface SearchQuery {
   mode: SearchMode;
 }
 
-function searchBody(qy: SearchQuery, extra: { refresh?: boolean; pageToken?: string } = {}) {
+function searchBody(
+  qy: SearchQuery,
+  extra: { refresh?: boolean; pageToken?: string; known?: KnownResult[] } = {}
+) {
   return JSON.stringify({
     city: qy.city,
     category: qy.category,
-    source: qy.mode === "general" ? "osm" : qy.mode === "denue" ? "denue" : undefined,
+    source: qy.mode === "general" ? "osm" : qy.mode === "google" ? undefined : qy.mode,
     global: qy.mode === "general",
     ...extra,
   });
@@ -114,6 +136,10 @@ export default function Home() {
   const [compose, setCompose] = useState<Business | null>(null);
   const [onlyActive, setOnlyActive] = useState(false);
   const [sortBy, setSortBy] = useState("score");
+  // Chips de contacto de Buscar (Y). Se guardan por usuario en localStorage.
+  const [contactSel, setContactSel] = useState<ContactFilterSel>({});
+  // WhatsApp detectado en la web del negocio al sacar su correo (por id).
+  const [waWeb, setWaWeb] = useState<Record<string, boolean>>({});
   const [socials, setSocials] = useState<Record<string, string[]>>({});
   const [guesses, setGuesses] = useState<Record<string, string[]>>({});
   const [autoProgress, setAutoProgress] = useState<{ done: number; total: number } | null>(null);
@@ -145,19 +171,22 @@ export default function Home() {
     fetch("/api/auth/me")
       .then((r) => (r.ok ? r.json() : null))
       .then((d: Me | null) => {
-        if (d?.email) setMe(d);
+        if (!d?.email) return;
+        setMe(d);
+        setContactSel(loadContactSel(d.email)); // filtros que dejó este usuario
       })
       .catch(() => {});
   }, []);
 
-  // Fuentes del servidor: con DENUE_TOKEN el modo por defecto es DENUE.
+  // Fuentes del servidor: con DENUE_TOKEN y Google el modo por defecto es Mixta;
+  // solo con DENUE_TOKEN, DENUE.
   useEffect(() => {
     fetch("/api/search")
       .then((r) => (r.ok ? r.json() : null))
-      .then((d: { denueAvailable?: boolean } | null) => {
+      .then((d: { denueAvailable?: boolean; googleAvailable?: boolean } | null) => {
         const ok = !!d?.denueAvailable;
         setDenueAvailable(ok);
-        if (ok && !modeTouched.current) setMode("denue");
+        if (ok && !modeTouched.current) setMode(d?.googleAvailable ? "mixta" : "denue");
       })
       .catch(() => setDenueAvailable(false));
   }, []);
@@ -276,7 +305,11 @@ export default function Home() {
       const res = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: searchBody(lastQuery, { pageToken: nextPageToken }),
+        body: searchBody(lastQuery, {
+          pageToken: nextPageToken,
+          // Mixta: lo ya mostrado, para emparejar la página nueva sin duplicar.
+          ...(lastQuery.mode === "mixta" ? { known: knownOf(results) } : {}),
+        }),
       });
       const data = (await res.json()) as SearchResponse & { error?: string };
       if (!res.ok) {
@@ -287,10 +320,8 @@ export default function Home() {
       const fresh = (data.results ?? [])
         .map((r) => ({ ...r, city: lastQuery.city }))
         .filter((r) => !seen.has(r.id) && seen.add(r.id));
-      setResults((rs) => {
-        const ids = new Set(rs.map((r) => r.id));
-        return [...rs, ...fresh.filter((r) => !ids.has(r.id))];
-      });
+      // Agrega sin repetir id; en mixta además quita `mergedIds` y aplica `updates`.
+      setResults((rs) => applyPage(rs, fresh, data));
       setNextPageToken(data.nextPageToken || null);
       if (data.notice) setNotice(data.notice);
       if (fresh.length) {
@@ -327,6 +358,7 @@ export default function Home() {
           (v) => Array.isArray(v) && v.length > 0
         );
       if (readable) setSiteOk((s) => ({ ...s, [b.id]: true }));
+      if (webHasWhatsapp(data)) setWaWeb((s) => ({ ...s, [b.id]: true }));
       setResults((rs) =>
         rs.map((r) =>
           r.id === b.id ? { ...r, email: email ?? "", emailIsGuess: email ? false : r.emailIsGuess } : r
@@ -435,6 +467,8 @@ export default function Home() {
   }
 
   // CSV solo con datos abiertos (DENUE / OSM): los de Google no se exportan.
+  // Tampoco sus señales (DENUE + Google): el Score se recalcula sin rating,
+  // reseñas ni businessStatus, igual que al guardar en Prospectos.
   function exportResultsCSV(rows: Business[]) {
     const open = rows.filter((r) => !isGoogleOnly(r));
     const google = rows.length - open.length;
@@ -443,7 +477,7 @@ export default function Home() {
         "negocios.csv",
         ["Score", "Nombre", "Giro", "Correo", "Teléfono", "Web", "Dirección", "Personal", "Fuente"],
         open.map((r) => [
-          r.score,
+          scoreLead(withoutGoogleLive(r), !!siteOk[r.id]).score,
           r.name,
           r.category,
           r.email,
@@ -460,8 +494,15 @@ export default function Home() {
     );
   }
 
-  // Resultados con score + distancia (si hay ubicación) + filtro + orden.
-  const filteredResults = useMemo(() => {
+  // Cambia los chips de contacto y los guarda para este usuario.
+  function changeContactSel(next: ContactFilterSel) {
+    setContactSel(next);
+    saveContactSel(me?.email, next);
+  }
+
+  // Resultados con score + distancia (si hay ubicación) + filtros + orden.
+  // contactCounts = cuántos quedarían al prender cada chip de contacto.
+  const { filteredResults, contactCounts } = useMemo(() => {
     let r = results.map((b) => {
       const s = scoreLead(b, !!siteOk[b.id]);
       return {
@@ -477,6 +518,21 @@ export default function Home() {
     // "Solo activos" y los órdenes por reseñas solo aplican con señales de Google.
     const hasAct = results.some((b) => b.lastReviewTime || b.rating != null);
     if (onlyActive && hasAct) r = r.filter((b) => isRecent(b.lastReviewTime));
+    // Chips de contacto (Y) sobre lo que queda; el correo se va llenando en segundo plano.
+    const cf = applyContactFilters(
+      r,
+      contactSel,
+      (b) => ({
+        email: b.email,
+        phone: b.phone,
+        website: b.website,
+        score: b.score,
+        waWeb: !!waWeb[b.id],
+        saved: !!matchFor(b),
+      }),
+      SEARCH_FILTER_KEYS
+    );
+    r = cf.items;
     const by = hasAct || sortBy === "cercanos" ? sortBy : "score";
     const sorted = [...r];
     if (by === "score") {
@@ -494,8 +550,8 @@ export default function Home() {
           (a.lastReviewTime ? Date.parse(a.lastReviewTime) : 0)
       );
     }
-    return sorted;
-  }, [results, onlyActive, sortBy, userCoords, siteOk]);
+    return { filteredResults: sorted, contactCounts: cf.counts };
+  }, [results, onlyActive, sortBy, userCoords, siteOk, contactSel, waWeb, matchFor]);
 
   const activeCount = useMemo(
     () => results.filter((b) => isRecent(b.lastReviewTime)).length,
@@ -505,6 +561,10 @@ export default function Home() {
     () => results.some((b) => b.lastReviewTime || b.rating != null),
     [results]
   );
+
+  // ¿Hay filtros encendidos? (para "12 de 40", la etiqueta del CSV y el vacío)
+  const contactOn = activeKeys(contactSel, SEARCH_FILTER_KEYS).length > 0;
+  const searchFiltered = contactOn || (onlyActive && hasActivityData);
 
   // Sin señales de Google (DENUE / OSM) solo aplican "Mejor prospecto" y cercanía.
   const sortOptions = useMemo(() => {
@@ -660,45 +720,60 @@ export default function Home() {
             {/* Selector de modo de búsqueda */}
             <div className="mt-3 flex flex-wrap items-center justify-center gap-2 text-xs">
               <span className="text-slate-400">Modo:</span>
-              <Segmented<SearchMode>
-                value={mode}
-                onChange={pickMode}
-                options={[
-                  {
-                    value: "denue",
-                    label: (
-                      <>
-                        <Icon.Building className="h-3.5 w-3.5" /> México · DENUE (recomendado)
-                      </>
-                    ),
-                  },
-                  {
-                    value: "google",
-                    label: (
-                      <>
-                        <Icon.Target className="h-3.5 w-3.5" /> Google (solo consulta)
-                      </>
-                    ),
-                  },
-                  {
-                    value: "general",
-                    label: (
-                      <>
-                        <Icon.Globe className="h-3.5 w-3.5" /> Mundial · OSM (gratis)
-                      </>
-                    ),
-                  },
-                ]}
-              />
+              {/* 4 modos: en pantallas chicas se desliza de lado */}
+              <div className="max-w-full overflow-x-auto [scrollbar-width:none]">
+                <Segmented<SearchMode>
+                  value={mode}
+                  onChange={pickMode}
+                  options={[
+                    {
+                      value: "mixta",
+                      title: "DENUE y Google a la vez, sin repetidos",
+                      label: (
+                        <>
+                          <Icon.LinkIcon className="h-3.5 w-3.5" /> Mixta · DENUE + Google (más
+                          resultados)
+                        </>
+                      ),
+                    },
+                    {
+                      value: "denue",
+                      label: (
+                        <>
+                          <Icon.Building className="h-3.5 w-3.5" /> México · DENUE
+                        </>
+                      ),
+                    },
+                    {
+                      value: "google",
+                      label: (
+                        <>
+                          <Icon.Target className="h-3.5 w-3.5" /> Google (solo consulta)
+                        </>
+                      ),
+                    },
+                    {
+                      value: "general",
+                      label: (
+                        <>
+                          <Icon.Globe className="h-3.5 w-3.5" /> Mundial · OSM (gratis)
+                        </>
+                      ),
+                    },
+                  ]}
+                />
+              </div>
             </div>
             <p className="mt-1 text-center text-xs text-slate-400">
-              {mode === "denue"
-                ? "Directorio oficial de INEGI: todo México, gratis. Se guarda, se exporta a CSV y va a GHL."
-                : mode === "google"
-                  ? "Consulta en vivo con Google. Sus datos no se exportan ni se pintan en el mapa; al guardar se vinculan con DENUE."
-                  : "Cualquier ciudad del mundo con OpenStreetMap. No gasta cuota de Google."}
+              {mode === "mixta"
+                ? "DENUE y Google a la vez, sin repetidos. Lo de DENUE se guarda, se exporta a CSV y va a GHL; lo de Google (calificación, reseñas y negocios que no están en DENUE) es solo consulta."
+                : mode === "denue"
+                  ? "Directorio oficial de INEGI: todo México, gratis. Se guarda, se exporta a CSV y va a GHL."
+                  : mode === "google"
+                    ? "Consulta en vivo con Google. Sus datos no se exportan ni se pintan en el mapa; al guardar se vinculan con DENUE."
+                    : "Cualquier ciudad del mundo con OpenStreetMap. No gasta cuota de Google."}
             </p>
-            {denueAvailable === false && (mode === "denue" || mode === "google") && (
+            {denueAvailable === false && mode !== "general" && (
               <p className="mx-auto mt-2 max-w-xl rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-left text-xs text-amber-800">
                 <b>DENUE no está configurado</b> en el servidor (falta <code>DENUE_TOKEN</code>
                 ). Mientras tanto se usa Google u OpenStreetMap. El token es gratis:{" "}
@@ -731,19 +806,27 @@ export default function Home() {
                 />
               ) : (
                 <span className="flex flex-wrap items-center gap-y-1 text-sm font-medium text-slate-600">
-                  {filteredResults.length} negocios
+                  {searchFiltered
+                    ? `${filteredResults.length} de ${results.length} negocios`
+                    : `${results.length} negocios`}
                   {source && (
                     <span
                       className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500"
-                      title={sourceCredit(
-                        source === "denue" ? "denue" : source === "google" ? "google" : "osm"
-                      )}
+                      title={
+                        source === "mixta"
+                          ? `${sourceCredit("denue")} · Google Maps solo consulta`
+                          : sourceCredit(
+                              source === "denue" ? "denue" : source === "google" ? "google" : "osm"
+                            )
+                      }
                     >
-                      {source === "denue"
-                        ? "DENUE (INEGI)"
-                        : source === "google"
-                          ? "Google · solo consulta"
-                          : "OSM (gratis)"}
+                      {source === "mixta"
+                        ? "DENUE + Google"
+                        : source === "denue"
+                          ? "DENUE (INEGI)"
+                          : source === "google"
+                            ? "Google · solo consulta"
+                            : "OSM (gratis)"}
                     </span>
                   )}
                   {cacheInfo && (
@@ -766,12 +849,6 @@ export default function Home() {
                       </button>
                     </span>
                   )}
-                  {autoProgress && (
-                    <span className="ml-2 flex items-center gap-1.5 rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-600">
-                      <span className="h-1.5 w-1.5 animate-ping rounded-full bg-indigo-500" />
-                      Sacando correos {autoProgress.done}/{autoProgress.total}
-                    </span>
-                  )}
                 </span>
               )}
             </div>
@@ -780,6 +857,7 @@ export default function Home() {
                 {hasActivityData && (
                   <button
                     onClick={() => setOnlyActive((v) => !v)}
+                    aria-pressed={onlyActive}
                     title="Sólo negocios con reseñas de los últimos 6 meses"
                     className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition ${
                       onlyActive
@@ -824,18 +902,46 @@ export default function Home() {
                 />
                 <button
                   onClick={() => exportResultsCSV(filteredResults)}
+                  disabled={!filteredResults.length}
                   title={
-                    googleCount
-                      ? "Descarga solo datos abiertos (DENUE / OSM): los de Google no se exportan por sus términos"
-                      : "Descargar estos resultados"
+                    (searchFiltered
+                      ? `Descarga solo los ${filteredResults.length} que ves con los filtros`
+                      : "Descargar estos resultados") +
+                    (googleCount
+                      ? ". Solo datos abiertos (DENUE / OSM): los de Google no se exportan por sus términos"
+                      : "")
                   }
-                  className="flex items-center gap-1.5 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                  className="flex items-center gap-1.5 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
                 >
-                  <Icon.Download className="h-3.5 w-3.5" /> CSV
+                  <Icon.Download className="h-3.5 w-3.5" />
+                  {searchFiltered ? `CSV (${filteredResults.length} filtrados)` : "CSV"}
                 </button>
               </div>
             )}
           </div>
+        )}
+
+        {/* Chips de contacto (Y): el conteo es cuántos quedarían al prender cada uno */}
+        {hasResults && !loading && (
+          <ContactFilters
+            keys={SEARCH_FILTER_KEYS}
+            value={contactSel}
+            onChange={changeContactSel}
+            counts={contactCounts}
+            hints={{
+              // Los correos llegan en segundo plano: el número de "Con correo" crece.
+              email: autoProgress && (
+                <span
+                  className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-indigo-50 px-2 py-1 text-[11px] font-medium text-indigo-600"
+                  title="Se están revisando las webs: el número de “Con correo” puede crecer"
+                >
+                  <span aria-hidden className="h-1.5 w-1.5 animate-ping rounded-full bg-indigo-500" />
+                  sacando correos {autoProgress.done}/{autoProgress.total}…
+                </span>
+              ),
+            }}
+            className="mb-4"
+          />
         )}
 
         {/* Aviso modo gratis */}
@@ -951,13 +1057,36 @@ export default function Home() {
         {isSearch && !loading && !showResults && !error && (
           <EmptyState
             icon={<Icon.Search className="h-8 w-8" />}
-            title={results.length ? "Ningún negocio activo" : "Empieza una búsqueda"}
-            sub={
-              results.length
-                ? "Quita el filtro “Solo activos” para ver todos."
-                : "Elige un giro y una ciudad para encontrar negocios."
+            title={
+              !results.length
+                ? "Empieza una búsqueda"
+                : contactOn
+                  ? "Ningún negocio con esos filtros"
+                  : "Ningún negocio activo"
             }
-          />
+            sub={
+              !results.length
+                ? "Elige un giro y una ciudad para encontrar negocios."
+                : contactOn
+                  ? autoProgress && contactSel.email
+                    ? "Aún se están sacando correos: pueden aparecer más. O quita algún filtro."
+                    : "Quita algún filtro para ver más negocios."
+                  : "Quita el filtro “Solo activos” para ver todos."
+            }
+          >
+            {results.length > 0 && searchFiltered && (
+              <button
+                type="button"
+                onClick={() => {
+                  setOnlyActive(false);
+                  changeContactSel({});
+                }}
+                className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+              >
+                Limpiar filtros
+              </button>
+            )}
+          </EmptyState>
         )}
       </main>
 

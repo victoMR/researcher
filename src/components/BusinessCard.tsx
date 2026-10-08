@@ -2,7 +2,13 @@
 
 import { useId, useState } from "react";
 import type { Business, LeadMatch, Me } from "@/lib/types";
-import { googleMapsUrl, isGoogleOnly, placeIdOf, sourceOf } from "@/lib/types";
+import {
+  googleMapsUrl,
+  isDenueWithGoogle,
+  isGoogleOnly,
+  placeIdOf,
+  sourceOf,
+} from "@/lib/types";
 import { buildWaText, logWhatsApp, waLink } from "@/lib/wa";
 import {
   firstName,
@@ -116,6 +122,8 @@ export default function BusinessCard({
   const recent = isRecent(b.lastReviewTime);
   const src = sourceOf(b);
   const google = isGoogleOnly(b);
+  // DENUE + Google (búsqueda mixta): datos de DENUE; lo de Google solo como referencia.
+  const both = isDenueWithGoogle(b);
   const placeId = placeIdOf(b);
 
   const owner = match?.ownerEmail ?? null;
@@ -161,7 +169,9 @@ export default function BusinessCard({
                 ? "bg-emerald-100 text-emerald-700"
                 : "bg-slate-100 text-slate-500"
             }`}
-            title={`Reseña más reciente: ${b.lastReviewAgo}`}
+            title={`Reseña más reciente en Google: ${b.lastReviewAgo}${
+              both ? " (solo referencia)" : ""
+            }`}
           >
             {recent && <Icon.Flame className="h-3 w-3" />}
             {b.lastReviewAgo}
@@ -170,9 +180,16 @@ export default function BusinessCard({
       </div>
       {/* Rating y reseñas: contenido de Google, con su etiqueta y enlace a su ficha */}
       {(b.rating != null || b.reviewCount != null) && (
-        <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-slate-500">
+        <div
+          className="mt-1 flex flex-wrap items-center gap-1 text-xs text-slate-500"
+          title={
+            both
+              ? "Calificación y reseñas de Google: solo para ver aquí. No se guardan ni se exportan."
+              : undefined
+          }
+        >
           <span className="rounded bg-slate-100 px-1 py-px text-[10px] font-semibold text-slate-500">
-            Google
+            {both ? "Google · solo referencia" : "Google"}
           </span>
           <Icon.Star className="h-3.5 w-3.5 text-amber-500" />
           <span className="font-medium text-slate-700">
@@ -191,7 +208,7 @@ export default function BusinessCard({
           )}
         </div>
       )}
-      {google && placeId && b.rating == null && b.reviewCount == null && (
+      {(google || both) && placeId && b.rating == null && b.reviewCount == null && (
         <a
           href={googleMapsUrl(placeId)}
           target="_blank"
@@ -398,14 +415,22 @@ export default function BusinessCard({
       </div>
       {/* Atribución de la fuente */}
       <p
-        className="mt-2 text-[10px] text-slate-400"
+        className="mt-2 flex flex-wrap items-center gap-1 text-[10px] text-slate-400"
         title={
           google
             ? "Contenido de Google: solo para consultar. Al guardarlo se vincula con DENUE o se guarda lo mínimo; no se exporta."
-            : undefined
+            : both
+              ? "Mismo negocio en DENUE y en Google. Se guardan y exportan solo los datos de DENUE; de Google solo su place_id."
+              : undefined
         }
       >
+        {both && (
+          <span className="rounded bg-indigo-50 px-1 py-px font-semibold text-indigo-600">
+            DENUE + Google
+          </span>
+        )}
         {sourceCredit(src)}
+        {both && " · Calificación: Google Maps (solo referencia)"}
       </p>
     </CardShell>
   );

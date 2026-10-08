@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCategory, matchesScian, type Category } from "@/lib/categories";
-import { PLACES_API, cleanCity, resolvePageToken, searchPlacesPage } from "@/lib/places";
+import {
+  PLACES_API,
+  cleanCity,
+  resolvePageToken,
+  searchPlacesPage,
+  type PlacesPage,
+} from "@/lib/places";
 import { OsmError, geocodePlace, searchOsm } from "@/lib/osm";
 import {
   DenueError,
@@ -17,7 +23,8 @@ import {
 import { googlePlacesDailyCap, trackCall, usedToday } from "@/lib/api-usage";
 import { coalesce, normalizeKeyPart } from "@/lib/search-cache";
 import { sessionEmail } from "@/lib/session";
-import type { Business, SearchResponse } from "@/lib/types";
+import { decodeMixedCursor, encodeMixedCursor, mergeMixed, parseKnown } from "@/lib/mixed-search";
+import type { Business, KnownResult, SearchResponse } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -25,12 +32,14 @@ export const maxDuration = 60;
 interface SearchBody {
   city?: unknown;
   category?: unknown;
-  // "denue" = México con DENUE (base), "google" = consulta en vivo, "osm" = gratis/mundial.
+  // "denue" = México con DENUE (base), "google" = consulta en vivo, "osm" = gratis/mundial,
+  // "mixta" = DENUE + Google en paralelo, unidos (src/lib/mixed-search.ts).
   // Sin source: Google si hay key, si no OSM (comportamiento anterior).
-  source?: "denue" | "google" | "osm";
+  source?: "denue" | "google" | "osm" | "mixta";
   global?: boolean; // true = búsqueda mundial (sin límite de país)
   refresh?: boolean; // true = ignora la caché y la renueva
-  pageToken?: unknown; // siguiente página (Google o DENUE; viene de nextPageToken)
+  pageToken?: unknown; // siguiente página (Google, DENUE o mixta; viene de nextPageToken)
+  known?: unknown; // mixta + pageToken: tarjetas ya mostradas (KnownResult[]) para no duplicar
 }
 
 // Qué fuentes tiene configuradas el servidor (para el selector de modo).
@@ -46,25 +55,56 @@ export async function GET(req: NextRequest) {
 }
 
 // Traduce el error de Google a un mensaje para el usuario.
-function googleErrorResponse(e: unknown, paging: boolean) {
+function googleError(
+  e: unknown,
+  paging: boolean
+): { message: string; status: number; transient: boolean } {
   console.error("places error", e);
   const msg = (e as Error)?.message || "";
   // Distingue fallo temporal de Google vs problema real de key/permisos.
   const transient = /\b(500|502|503|504|429)\b/.test(msg);
   const keyIssue = /\b(401|403)\b/.test(msg) || /REQUEST_DENIED|PERMISSION/i.test(msg);
   const badToken = paging && /\b400\b|INVALID_ARGUMENT/i.test(msg);
-  return NextResponse.json(
-    {
-      error: transient
-        ? "Google está saturado ahora mismo. Intenta de nuevo en unos segundos."
-        : keyIssue
-          ? "Google rechazó la API key (revisa permisos/facturación en Google Cloud)."
-          : badToken
-            ? "La página siguiente ya expiró. Vuelve a buscar."
-            : "No se pudo completar la búsqueda con Google. Intenta de nuevo.",
-    },
-    { status: badToken ? 400 : 502 }
-  );
+  return {
+    message: transient
+      ? "Google está saturado ahora mismo. Intenta de nuevo en unos segundos."
+      : keyIssue
+        ? "Google rechazó la API key (revisa permisos/facturación en Google Cloud)."
+        : badToken
+          ? "La página siguiente ya expiró. Vuelve a buscar."
+          : "No se pudo completar la búsqueda con Google. Intenta de nuevo.",
+    status: badToken ? 400 : 502,
+    transient,
+  };
+}
+
+function googleErrorResponse(e: unknown, paging: boolean) {
+  const g = googleError(e, paging);
+  return NextResponse.json({ error: g.message }, { status: g.status });
+}
+
+// Tope diario de gasto (sin BD no hay conteo -> sin tope; 0 = nunca usar Google).
+async function googleCap(): Promise<{ cap: number; capped: boolean }> {
+  const cap = googlePlacesDailyCap();
+  if (cap === 0) return { cap, capped: true };
+  const used = await usedToday(PLACES_API);
+  return { cap, capped: used !== null && used >= cap };
+}
+
+// Una página de Google (= 1 solicitud cobrada). Búsquedas idénticas simultáneas
+// -> una sola llamada (y un solo cobro).
+function googlePage(
+  queryCity: string,
+  cat: Category,
+  apiKey: string,
+  googleToken?: string
+): Promise<PlacesPage> {
+  const key = ["google", cat.slug, normalizeKeyPart(queryCity), googleToken ?? ""].join("|");
+  return coalesce(key, async () => {
+    const r = await searchPlacesPage(queryCity, cat, apiKey, googleToken);
+    await trackCall(PLACES_API); // sólo se cobran las exitosas
+    return r;
+  });
 }
 
 /* ---------- DENUE ---------- */
@@ -272,6 +312,163 @@ async function searchDenue(
   };
 }
 
+/* ---------- Mixta: DENUE + Google en paralelo ---------- */
+
+// null = esa fuente no se consultó (sin configurar, tope o sin más páginas).
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown } | null;
+
+// Engancha el manejo de error de inmediato (sin rechazos "sueltos" mientras esperamos la otra).
+function settle<T>(p: Promise<T> | null): Promise<Settled<T>> {
+  return p
+    ? p.then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error })
+      )
+    : Promise.resolve(null);
+}
+
+const BAD_TOKEN = "El token de página no corresponde a esta búsqueda. Vuelve a buscar.";
+
+interface MixedOutcome {
+  payload?: SearchResponse;
+  error?: { message: string; status: number };
+  fallback?: string; // ninguna fuente respondió (1a página): aviso y seguimos con OSM
+}
+
+/**
+ * DENUE + Google para la misma ciudad y giro (solo México, sin OSM). Si una fuente
+ * no está configurada, llegó a su tope o falla, se usa la otra con un aviso.
+ * "Cargar más" pide la siguiente página de cada fuente que tenga más (token
+ * combinado) y empareja lo nuevo también contra `known` (lo ya mostrado):
+ * responde `updates` (señales de Google para tarjetas DENUE ya mostradas) y
+ * `mergedIds` (tarjetas solo-Google que se quitan porque ahora llegan unidas a
+ * un DENUE nuevo); el cliente las aplica con applyPage (src/lib/types.ts).
+ */
+async function searchMixed(
+  city: string,
+  cat: Category,
+  opts: { refresh: boolean; pageToken?: string; known: KnownResult[] }
+): Promise<MixedOutcome> {
+  const paging = !!opts.pageToken;
+  const q = normalizeKeyPart(city);
+  let dToken: string | undefined;
+  let gCursor: string | undefined;
+  let gPage: { city: string; googleToken: string } | undefined;
+  if (opts.pageToken) {
+    const cur = decodeMixedCursor(opts.pageToken);
+    if (!cur || cur.c !== cat.slug || cur.q !== q) {
+      return { error: { message: BAD_TOKEN, status: 400 } };
+    }
+    dToken = cur.d;
+    if (cur.g) {
+      gPage = resolvePageToken(cur.g, city, cat) ?? undefined;
+      if (!gPage) return { error: { message: BAD_TOKEN, status: 400 } };
+      gCursor = cur.g;
+    }
+  }
+
+  const notes: string[] = [];
+  const denueOn = denueReady();
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+
+  // DENUE arranca ya; el tope de Google se revisa mientras tanto.
+  let denueTask: Promise<SearchResponse> | null = null;
+  if (!paging || dToken) {
+    if (denueOn) {
+      denueTask = searchDenue(city, cat, { refresh: opts.refresh && !paging, pageToken: dToken });
+    } else {
+      notes.push("DENUE no está configurado (falta DENUE_TOKEN; es gratis en inegi.org.mx).");
+    }
+  }
+  const denueP = settle(denueTask);
+
+  let googleTask: Promise<PlacesPage> | null = null;
+  if (!paging || gPage) {
+    if (!apiKey) {
+      notes.push("Google no está configurado (falta GOOGLE_PLACES_API_KEY).");
+    } else {
+      const { cap, capped } = await googleCap();
+      if (capped) {
+        notes.push(
+          cap === 0
+            ? "Google está desactivado (GOOGLE_PLACES_DAILY_CAP=0)."
+            : `Se alcanzó el tope diario de Google (${cap} búsquedas).`
+        );
+      }
+      else googleTask = googlePage(gPage?.city ?? city, cat, apiKey, gPage?.googleToken);
+    }
+  }
+  const [d, g] = await Promise.all([denueP, settle(googleTask)]);
+
+  // Errores de una fuente no tumban la otra: se avisan y, si es temporal, el
+  // token de esa fuente se conserva para reintentar en el siguiente "Cargar más".
+  let nextD: string | undefined;
+  let nextG: string | undefined;
+  let denueErr: { message: string; status: number } | undefined;
+  let googleErr: { message: string; status: number } | undefined;
+  if (d?.ok) {
+    nextD = d.value.nextPageToken;
+    if (d.value.notice) notes.push(d.value.notice);
+  } else if (d) {
+    const e = d.error;
+    const known = e instanceof DenueError || e instanceof OsmError;
+    console.error("mixta denue", known ? e.message : e);
+    denueErr = known
+      ? { message: e.message, status: e.status }
+      : { message: "No se pudo consultar el DENUE (INEGI).", status: 502 };
+    notes.push(/denue/i.test(denueErr.message) ? denueErr.message : `DENUE: ${denueErr.message}`);
+    if (paging && denueErr.status >= 500) nextD = dToken;
+  }
+  if (g?.ok) {
+    nextG = g.value.nextPageToken;
+  } else if (g) {
+    const ge = googleError(g.error, paging);
+    googleErr = { message: ge.message, status: ge.status };
+    notes.push(ge.message);
+    if (paging && ge.transient) nextG = gCursor;
+  }
+
+  if (!d?.ok && !g?.ok) {
+    // Error del usuario (ciudad fuera de México, token): se muestra tal cual.
+    if (denueErr && denueErr.status < 500) return { error: denueErr };
+    if (paging) {
+      return {
+        error: denueErr ??
+          googleErr ?? { message: "No se pudieron cargar más resultados.", status: 502 },
+      };
+    }
+    return { fallback: `${notes.join(" ")} Mostrando resultados gratis de OpenStreetMap.` };
+  }
+
+  const both = !!d?.ok && !!g?.ok;
+  if (!both && notes.length) {
+    notes.push(
+      d?.ok ? "Mostrando solo DENUE." : "Mostrando solo Google (solo consulta: no se exporta)."
+    );
+  }
+  const mix = mergeMixed(
+    d?.ok ? d.value.results : [],
+    g?.ok ? g.value.results : [],
+    paging ? opts.known : []
+  );
+  const payload: SearchResponse = {
+    city: d?.ok ? d.value.city : city,
+    count: mix.results.length,
+    results: mix.results,
+    source: both ? "mixta" : d?.ok ? "denue" : "google",
+    denueAvailable: denueOn,
+    mix: mix.stats,
+    ...(paging ? { mergedIds: mix.mergedIds, updates: mix.updates } : {}),
+    // "En caché" solo si todo vino de DENUE (Google siempre es en vivo y gasta cuota).
+    ...(d?.ok && !g?.ok && d.value.cached ? { cached: true, cachedAt: d.value.cachedAt } : {}),
+    ...(notes.length ? { notice: notes.join(" ") } : {}),
+    ...(nextD || nextG
+      ? { nextPageToken: encodeMixedCursor({ d: nextD, g: nextG, c: cat.slug, q }) }
+      : {}),
+  };
+  return { payload };
+}
+
 export async function POST(req: NextRequest) {
   try {
     let body: SearchBody;
@@ -307,6 +504,23 @@ export async function POST(req: NextRequest) {
     const denueAvailable = denueReady();
     let notice: string | undefined;
 
+    // Mixta: DENUE + Google en paralelo, unidos (ver searchMixed).
+    if (source === "mixta") {
+      const r = await searchMixed(city, cat, {
+        refresh: !!refresh,
+        pageToken,
+        known: pageToken ? parseKnown(body.known) : [],
+      });
+      if (r.payload) return NextResponse.json(r.payload);
+      if (r.error) {
+        return NextResponse.json(
+          { error: r.error.message, denueAvailable },
+          { status: r.error.status }
+        );
+      }
+      notice = r.fallback; // ninguna fuente respondió: OSM (México) con aviso
+    }
+
     // Fuente base en México: DENUE (INEGI, datos abiertos: se guarda y exporta).
     if (source === "denue") {
       if (denueAvailable) {
@@ -336,7 +550,10 @@ export async function POST(req: NextRequest) {
     // "osm" fuerza modo gratis; si DENUE falló caemos directo a OSM.
     const apiKey = process.env.GOOGLE_PLACES_API_KEY;
     const useGoogle =
-      !!apiKey && source !== "osm" && !(source === "denue" && denueAvailable);
+      !!apiKey &&
+      source !== "osm" &&
+      source !== "mixta" &&
+      !(source === "denue" && denueAvailable);
 
     if (pageToken && !useGoogle) {
       return NextResponse.json(
@@ -362,25 +579,12 @@ export async function POST(req: NextRequest) {
         googleToken = resolved.googleToken;
       }
 
-      // Tope diario de gasto (null = sin BD -> sin tope).
-      const cap = googlePlacesDailyCap();
-      const used = await usedToday(PLACES_API);
-      const capped = used !== null && used >= cap;
+      // Tope diario de gasto (sin BD -> sin tope).
+      const { cap, capped } = await googleCap();
 
       if (!capped) {
         try {
-          // Búsquedas idénticas simultáneas -> una sola llamada (y un solo cobro).
-          const key = [
-            "google",
-            cat.slug,
-            normalizeKeyPart(queryCity),
-            googleToken ?? "",
-          ].join("|");
-          const page = await coalesce(key, async () => {
-            const r = await searchPlacesPage(queryCity, cat, apiKey, googleToken);
-            await trackCall(PLACES_API); // sólo se cobran las exitosas
-            return r;
-          });
+          const page = await googlePage(queryCity, cat, apiKey, googleToken);
           const payload: SearchResponse = {
             city,
             count: page.results.length,
@@ -416,7 +620,7 @@ export async function POST(req: NextRequest) {
     // Si caímos aquí por un aviso (tope de Google, DENUE), buscamos sólo en México.
     try {
       const osm = await searchOsm(city, cat, {
-        global: !!global && !notice && source !== "denue",
+        global: !!global && !notice && source !== "denue" && source !== "mixta",
         refresh: !!refresh,
       });
       const payload: SearchResponse = {

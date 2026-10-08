@@ -13,7 +13,13 @@ import {
   type LeadFilters,
 } from "@/lib/useLeads";
 import { downloadCSV, personName, shortDate } from "@/lib/format";
+import {
+  PROSPECT_FILTER_KEYS,
+  activeKeys,
+  type ContactFilterSel,
+} from "@/lib/contact-filters";
 import LeadCard, { canEditLead } from "@/components/LeadCard";
+import ContactFilters from "@/components/ContactFilters";
 import MapView from "@/components/MapView";
 import { EmptyState, Segmented, SkeletonCard, STATUS_META } from "@/components/ui";
 import * as Icon from "@/components/icons";
@@ -24,6 +30,7 @@ export interface ProspectFilters {
   q: string;
   status: LeadStatus | null;
   owner: OwnerFilter;
+  contact: ContactFilterSel; // con correo / teléfono / web / WhatsApp / score (Y, en el servidor)
   page: number;
   view: "lista" | "mapa";
 }
@@ -32,6 +39,7 @@ export const DEFAULT_PROSPECT_FILTERS: ProspectFilters = {
   q: "",
   status: null,
   owner: "mine",
+  contact: {},
   page: 1,
   view: "lista",
 };
@@ -157,11 +165,14 @@ export default function Prospects({
     return () => clearTimeout(t);
   }, [qInput, filters.q, setFilters]);
 
+  // CSV y GHL piden todas las páginas con estos mismos filtros.
   const listFilters: LeadFilters = {
     q: filters.q,
     status: filters.status,
     owner: filters.owner,
+    contact: filters.contact,
   };
+  const contactOn = activeKeys(filters.contact, PROSPECT_FILTER_KEYS).length > 0;
   const { data, error, loading, patchLocal, removeLocal } = useLeadList(
     { ...listFilters, page: filters.page, pageSize: PAGE_SIZE },
     `${refreshKey}:${localKey}`
@@ -173,7 +184,7 @@ export default function Prospects({
   const from = leads.length && data ? (data.page - 1) * data.pageSize + 1 : 0;
   const to = leads.length ? from + leads.length - 1 : 0;
   const statusSum = counts ? LEAD_STATUSES.reduce((a, s) => a + (counts.byStatus[s] ?? 0), 0) : 0;
-  const filtered = !!filters.q || !!filters.status;
+  const filtered = !!filters.q || !!filters.status || contactOn;
 
   const set = (patch: Partial<ProspectFilters>) =>
     setFilters((f) => ({ ...f, page: 1, ...patch }));
@@ -185,7 +196,7 @@ export default function Prospects({
 
   function clearFilters() {
     setQInput("");
-    set({ q: "", status: null });
+    set({ q: "", status: null, contact: {} });
   }
 
   // Tras un cambio en el servidor: recarga la página y avisa al padre.
@@ -424,7 +435,7 @@ export default function Prospects({
         <button
           onClick={exportAll}
           disabled={!total || !!busy}
-          title="Descargar todos los prospectos de este filtro"
+          title="Descargar todos los prospectos de este filtro (búsqueda, estatus y chips de contacto)"
           className="flex items-center gap-1.5 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
         >
           <Icon.Download className="h-3.5 w-3.5" />
@@ -433,7 +444,7 @@ export default function Prospects({
         <button
           onClick={ghlAll}
           disabled={!total || !!busy}
-          title="Enviar a GHL todos los prospectos de este filtro"
+          title="Enviar a GHL todos los prospectos de este filtro (búsqueda, estatus y chips de contacto)"
           className="flex items-center gap-1.5 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
         >
           <Icon.Send className="h-3.5 w-3.5" />
@@ -444,7 +455,7 @@ export default function Prospects({
       </div>
 
       {/* Chips de estatus con conteo */}
-      <div className="mb-4 flex flex-wrap items-center gap-1.5">
+      <div className="mb-2 flex flex-wrap items-center gap-1.5">
         <StatusChip
           active={!filters.status}
           label="Todos"
@@ -467,6 +478,15 @@ export default function Prospects({
           </span>
         )}
       </div>
+
+      {/* Chips de contacto (Y, en el servidor): conteo = cuántos quedarían */}
+      <ContactFilters
+        keys={PROSPECT_FILTER_KEYS}
+        value={filters.contact}
+        onChange={(contact) => set({ contact })}
+        counts={counts?.contact}
+        className="mb-4"
+      />
 
       {error && (
         <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
@@ -569,7 +589,7 @@ export default function Prospects({
             <EmptyState
               icon={<Icon.Search className="h-8 w-8" />}
               title="Sin resultados"
-              sub="Ningún prospecto coincide con la búsqueda o el estatus elegido."
+              sub="Ningún prospecto coincide con la búsqueda, el estatus o los filtros de contacto."
             >
               <EmptyButton onClick={clearFilters}>Limpiar filtros</EmptyButton>
             </EmptyState>
@@ -620,6 +640,8 @@ function StatusChip({
 }) {
   return (
     <button
+      type="button"
+      aria-pressed={active}
       onClick={onClick}
       className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition ${
         active

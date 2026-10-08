@@ -10,7 +10,15 @@ import {
   denueToBusiness,
   type DenueMatch,
 } from "./denue";
-import { LEAD_STATUSES, hasCoords, isGoogleOnly, placeIdOf, sourceOf } from "./types";
+import {
+  LEAD_STATUSES,
+  hasCoords,
+  isGoogleOnly,
+  placeIdOf,
+  sourceOf,
+  withoutGoogleLive,
+} from "./types";
+import { SCORE_CHIP_MIN, type ContactQuery } from "./contact-filters";
 import type {
   Business,
   DataSource,
@@ -169,6 +177,77 @@ function ownerCond(sql: Sql, owner: OwnerFilter, me: string | null) {
   return me ? sql`owner_email = ${me}` : sql`FALSE`;
 }
 
+// Teléfono MX válido sobre los dígitos: igual que isValidMxPhone (10 dígitos,
+// o con 52 / 521 / 01 adelante).
+const MX_PHONE_RE = "^(521[0-9]{10}|52[0-9]{10}|01[0-9]{10}|[0-9]{10})$";
+// Correos de área (LOW_ROLE en scoring.ts); el lookahead equivale a su \b y
+// la Ó va explícita (con collation "C" el ~* no pasa a minúsculas lo no ASCII).
+const LOW_ROLE_RE =
+  "^(soporte|support|facturacion|facturaci[oóÓ]n|cobranza|rh|recursoshumanos|reclutamiento|empleo|vacantes|cv|curriculum|sistemas|it)(?=[^A-Za-z0-9_]|$)";
+const DAY_S = 86400;
+
+// Campo con algo más que espacios (como `(v || "").trim() !== ""`).
+const filledCol = (sql: Sql, col: "email" | "phone" | "website" | "address") =>
+  sql`(COALESCE(${sql(col)}, '') ~ '[^[:space:]]')`;
+
+// Score por resta calculado en SQL, igual que rowToLead -> computeScore (con
+// los datos guardados: sin "correo sugerido" ni estatus de Google y con
+// checked_at o, si falta, created_at). Si cambias src/lib/scoring.ts, cambia esto.
+function scoreExpr(sql: Sql) {
+  return sql`GREATEST(1, LEAST(10, 10
+    - (CASE WHEN NOT ${filledCol(sql, "phone")} THEN 3
+            WHEN regexp_replace(phone, '[^0-9]', '', 'g') !~ ${MX_PHONE_RE} THEN 1 ELSE 0 END)
+    - (CASE WHEN NOT ${filledCol(sql, "email")} THEN 3
+            WHEN split_part(regexp_replace(email, '^[[:space:]]+|[[:space:]]+$', '', 'g'), '@', 1)
+                 ~* ${LOW_ROLE_RE} THEN 1 ELSE 0 END)
+    - (CASE WHEN last_review IS NULL THEN 2
+            WHEN extract(epoch FROM now() - last_review) > ${365 * DAY_S} THEN 2
+            WHEN extract(epoch FROM now() - last_review) > ${180 * DAY_S} THEN 1 ELSE 0 END)
+    - (CASE WHEN extract(epoch FROM now() - COALESCE(checked_at, created_at)) > ${180 * DAY_S}
+            THEN 1 ELSE 0 END)
+    - (CASE WHEN ${filledCol(sql, "address")} THEN 0 ELSE 1 END)
+    - (CASE WHEN ${filledCol(sql, "website")} THEN 0 ELSE 1 END)
+  ))`;
+}
+
+type ContactKey = "email" | "phone" | "website" | "whatsapp" | "score";
+const CONTACT_KEYS: ContactKey[] = ["email", "phone", "website", "whatsapp", "score"];
+
+// Condición SQL de cada chip de contacto (criterio en src/lib/contact-filters.ts).
+function contactCond(sql: Sql, k: ContactKey, minScore: number) {
+  switch (k) {
+    case "email":
+    case "phone":
+    case "website":
+      return filledCol(sql, k);
+    case "whatsapp":
+      // Basta un número válido entre los separados por ; , / |
+      return sql`EXISTS (
+        SELECT 1 FROM regexp_split_to_table(phone, '[;,/|]') AS p(x)
+        WHERE regexp_replace(p.x, '[^0-9]', '', 'g') ~ ${MX_PHONE_RE}
+      )`;
+    case "score":
+      return sql`(${scoreExpr(sql)} >= ${minScore})`;
+  }
+}
+
+// Filtros de contacto activos -> claves de chip.
+function activeContact(c: Partial<ContactQuery> | undefined): ContactKey[] {
+  if (!c) return [];
+  const on: ContactKey[] = [];
+  if (c.hasEmail) on.push("email");
+  if (c.hasPhone) on.push("phone");
+  if (c.hasWebsite) on.push("website");
+  if (c.hasWhatsapp) on.push("whatsapp");
+  if (c.minScore != null && Number.isFinite(c.minScore)) on.push("score");
+  return on;
+}
+
+// Y de las condiciones (TRUE si no hay ninguna).
+function andAll(sql: Sql, conds: ReturnType<typeof textCond>[]) {
+  return conds.length ? conds.reduce((acc, c) => sql`${acc} AND ${c}`) : sql`TRUE`;
+}
+
 export interface ListOptions {
   q?: string;
   status?: LeadStatus | null;
@@ -176,6 +255,7 @@ export interface ListOptions {
   me?: string | null;
   page?: number; // 1..n
   pageSize?: number; // 0 = solo conteos
+  contact?: Partial<ContactQuery>; // con correo / teléfono / web / WhatsApp / score mínimo
 }
 
 // Lista paginada con filtros + conteos para los chips.
@@ -190,6 +270,12 @@ export async function listLeads(opts: ListOptions = {}): Promise<LeadsPage> {
   const pageSize = Math.max(0, Math.min(200, Math.floor(opts.pageSize ?? 30)));
   const page = Math.max(1, Math.floor(opts.page ?? 1));
   const offset = (page - 1) * pageSize;
+  const ms = opts.contact?.minScore;
+  const minScore =
+    ms != null && Number.isFinite(ms) ? Math.max(1, Math.min(10, Math.floor(ms))) : SCORE_CHIP_MIN;
+  const onContact = activeContact(opts.contact);
+  // Fragmentos nuevos en cada uso (como textCond / ownerCond).
+  const contactWhere = () => andAll(sql, onContact.map((k) => contactCond(sql, k, minScore)));
 
   const rowsQuery =
     pageSize > 0
@@ -198,20 +284,32 @@ export async function listLeads(opts: ListOptions = {}): Promise<LeadsPage> {
           WHERE ${textCond(sql, q)}
             AND ${ownerCond(sql, owner, me)}
             AND ${status ? sql`status = ${status}` : sql`TRUE`}
+            AND ${contactWhere()}
           ORDER BY created_at DESC, id
           LIMIT ${pageSize} OFFSET ${offset}
         `
       : Promise.resolve([]);
 
-  // Conteos: respetan q; byStatus además respeta owner (no status).
+  // Conteos: respetan q y los filtros de contacto; byStatus además respeta
+  // owner (no status). c_<chip> = cuántos quedarían al prender ese chip (con
+  // owner; status se aplica al sumar). Con pageSize=0 no se calculan.
+  const chip = (k: ContactKey) =>
+    pageSize > 0
+      ? sql`count(*) FILTER (WHERE ${ownerCond(sql, owner, me)} AND ${contactCond(sql, k, minScore)})`
+      : sql`0`;
   const countsQuery = sql`
     SELECT status,
       count(*) FILTER (WHERE ${ownerCond(sql, owner, me)}) AS n,
       count(*) FILTER (WHERE ${ownerCond(sql, "mine", me)}) AS mine,
       count(*) FILTER (WHERE owner_email IS NULL) AS unassigned,
-      count(*) AS all_count
+      count(*) AS all_count,
+      ${chip("email")} AS c_email,
+      ${chip("phone")} AS c_phone,
+      ${chip("website")} AS c_website,
+      ${chip("whatsapp")} AS c_whatsapp,
+      ${chip("score")} AS c_score
     FROM leads
-    WHERE ${textCond(sql, q)}
+    WHERE ${textCond(sql, q)} AND ${contactWhere()}
     GROUP BY status
   `;
 
@@ -221,6 +319,7 @@ export async function listLeads(opts: ListOptions = {}): Promise<LeadsPage> {
     LeadStatus,
     number
   >;
+  const contact = Object.fromEntries(CONTACT_KEYS.map((k) => [k, 0])) as Record<ContactKey, number>;
   let mine = 0;
   let unassigned = 0;
   let all = 0;
@@ -232,6 +331,9 @@ export async function listLeads(opts: ListOptions = {}): Promise<LeadsPage> {
     mine += Number(r.mine ?? 0);
     unassigned += Number(r.unassigned ?? 0);
     all += Number(r.all_count ?? 0);
+    if (!status || r.status === status) {
+      for (const k of CONTACT_KEYS) contact[k] += Number(r[`c_${k}`] ?? 0);
+    }
   }
 
   return {
@@ -239,7 +341,7 @@ export async function listLeads(opts: ListOptions = {}): Promise<LeadsPage> {
     total: status ? byStatus[status] : inOwner,
     page,
     pageSize,
-    counts: { byStatus, mine, unassigned, all },
+    counts: { byStatus, mine, unassigned, all, ...(pageSize > 0 ? { contact } : {}) },
   };
 }
 
@@ -348,6 +450,8 @@ async function mergeInto(sql: Sql, row: Row, rec: Business, x: SaveCtx): Promise
       denue_id = COALESCE(denue_id, ${x.denueId}),
       place_id = COALESCE(place_id, ${x.placeId}),
       owner_email = COALESCE(owner_email, ${x.owner}),
+      -- Solo de Google (ver en vivo): nunca se guardan; limpia lo que hubiera de antes.
+      rating = NULL, review_count = NULL, last_review = NULL,
       checked_at = CASE WHEN ${contact}::boolean THEN now() ELSE checked_at END,
       updated_at = now()
     WHERE id = ${id}
@@ -375,15 +479,17 @@ export async function saveLead(
   const owner = ownerEmail ? ownerEmail.toLowerCase() : null;
   const placeId = placeIdOf(b) ?? null;
 
-  let rec: Business = b;
+  // Términos de Google: rating, reseñas, última reseña y businessStatus son solo
+  // para ver en vivo. NUNCA se guardan, venga de donde venga el negocio (también
+  // DENUE + Google de la búsqueda mixta); el score guardado tampoco los usa.
+  let rec: Business = withoutGoogleLive(b);
   let source: DataSource = sourceOf(b);
   let coordsExpire: Date | null = null;
 
   if (source === "google") {
     if (b.denueId) {
-      // Ya viene vinculado con DENUE (p. ej. del agente): sin señales de Google.
+      // Ya viene vinculado con DENUE (p. ej. del agente).
       source = "denue";
-      rec = { ...b, rating: undefined, reviewCount: undefined, lastReviewTime: undefined };
     } else {
       const m = await matchDenueSafe(b, city);
       if (m) {
@@ -402,7 +508,6 @@ export async function saveLead(
 
   const x: SaveCtx = { owner, source, placeId, denueId: rec.denueId ?? null };
   const key = dedupeKey(rec.name, city);
-  const lastReview = rec.lastReviewTime ? new Date(rec.lastReviewTime) : null;
   const score = scoreOf(rec, new Date()).score;
   const lat = hasCoords(rec) ? rec.lat : null;
   const lon = hasCoords(rec) ? rec.lon : null;
@@ -426,8 +531,8 @@ export async function saveLead(
     ) VALUES (
       ${rec.id}, ${key}, ${rec.name}, ${rec.category}, ${city || null}, ${rec.phone || null},
       ${rec.website || null}, ${rec.email || null}, ${rec.address || null},
-      ${lat}, ${lon}, ${rec.rating ?? null}, ${rec.reviewCount ?? null},
-      ${lastReview}, ${score}, ${source}, 'nuevo', ${owner},
+      ${lat}, ${lon}, NULL, NULL, NULL, -- rating, review_count, last_review: solo Google, nunca se guardan
+      ${score}, ${source}, 'nuevo', ${owner},
       ${x.placeId}, ${x.denueId}, ${lat == null ? null : coordsExpire}, now()
     )
     ON CONFLICT DO NOTHING

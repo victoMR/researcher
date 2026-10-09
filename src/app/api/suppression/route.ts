@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasDb } from "@/lib/db";
-import { isAdmin, sessionEmail } from "@/lib/session";
+import { sessionEmail, sessionUser } from "@/lib/session";
 import {
   addSuppression,
   getSuppression,
@@ -62,8 +62,7 @@ export async function POST(req: NextRequest) {
 
 // Quita una BAJA (solo administradores).
 export async function DELETE(req: NextRequest) {
-  const me = await sessionEmail(req);
-  if (!isAdmin(me)) {
+  if (!(await sessionUser(req))?.isAdmin) {
     return NextResponse.json(
       { error: "Solo un administrador puede quitar una BAJA." },
       { status: 403 }

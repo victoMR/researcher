@@ -4,7 +4,8 @@ import { mcpHandler, type McpCaller } from "@/lib/mcp/server";
 
 // Servidor MCP remoto (Streamable HTTP, sin estado) para Claude Code / Claude
 // Desktop. No usa la cookie de sesión: cada vendedor manda su propio token
-// (Authorization: Bearer <token>, ver MCP_TOKENS y docs/mcp.md). El proxy deja
+// (Authorization: Bearer <token>; se genera en la pestaña Equipo o va en
+// MCP_TOKENS, ver docs/mcp.md). El proxy deja
 // pasar /api/mcp sin cookie porque esta ruta valida su propio token.
 export const runtime = "nodejs";
 // investigar_con_agente sigue en segundo plano con after(): necesita los
@@ -36,10 +37,16 @@ async function handle(req: NextRequest): Promise<Response> {
     return jsonRpcError(403, "Origen no permitido.");
   }
   if (!mcpConfigured()) {
-    return jsonRpcError(503, "El servidor MCP no está configurado (falta MCP_TOKENS).");
+    return jsonRpcError(503, "El servidor MCP no está configurado (no hay MCP_TOKENS ni base de datos).");
   }
   const token = bearerToken(req.headers.get("authorization"));
-  const email = token ? emailForToken(token) : null;
+  let email: string | null = null;
+  try {
+    email = token ? await emailForToken(token) : null;
+  } catch (e) {
+    console.error("mcp auth", e);
+    return jsonRpcError(503, "No se pudo validar el token: la base de datos no responde. Intenta en un momento.");
+  }
   if (!token || !email) return unauthorized(!!token);
 
   const appUrl = (process.env.APP_URL?.trim() || req.nextUrl.origin).replace(/\/$/, "");

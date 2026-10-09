@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasDb } from "@/lib/db";
 import { listLeads, saveLead, clearLeads } from "@/lib/leads-repo";
-import { isAdmin, sessionEmail } from "@/lib/session";
+import { sessionEmail, sessionUser } from "@/lib/session";
 import { LEAD_STATUSES } from "@/lib/types";
 import { parseContactParams } from "@/lib/contact-filters";
 import type { Business, LeadStatus, OwnerFilter } from "@/lib/types";
@@ -70,7 +70,7 @@ export async function POST(req: NextRequest) {
 // Vaciar TODOS los prospectos: solo administradores.
 export async function DELETE(req: NextRequest) {
   if (!hasDb()) return noDb();
-  if (!isAdmin(await sessionEmail(req))) {
+  if (!(await sessionUser(req))?.isAdmin) {
     return NextResponse.json(
       { error: "Solo un administrador puede vaciar los prospectos." },
       { status: 403 }

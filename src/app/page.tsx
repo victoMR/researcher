@@ -39,6 +39,9 @@ import Prospects, {
   type ProspectFilters,
 } from "@/components/Prospects";
 import ResearchPanel from "@/components/research/ResearchPanel";
+import Team from "@/components/Team";
+import UserMenu from "@/components/UserMenu";
+import PasswordModal from "@/components/PasswordModal";
 import { EmptyState, Segmented, SkeletonCard } from "@/components/ui";
 import * as Icon from "@/components/icons";
 
@@ -92,8 +95,9 @@ function distanceKm(
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-type Tab = "investigar" | "buscar" | "prospectos" | "plantillas" | "metricas";
+type Tab = "investigar" | "buscar" | "prospectos" | "plantillas" | "metricas" | "equipo";
 const TABS: Tab[] = ["investigar", "buscar", "prospectos", "plantillas", "metricas"];
+const ADMIN_TABS: Tab[] = [...TABS, "equipo"]; // Equipo: solo administradores
 type View = "lista" | "mapa";
 // mixta = DENUE + Google unidos (lo de DENUE se guarda/exporta, lo de Google es
 // solo consulta); denue = México con DENUE (base, se guarda/exporta);
@@ -118,6 +122,21 @@ function searchBody(
     global: qy.mode === "general",
     ...extra,
   });
+}
+
+// Vuelve a leer quién está logueado. Si la sesión ya no vale, manda al login.
+async function refreshMe(): Promise<Me | null> {
+  try {
+    const r = await fetch("/api/auth/me", { cache: "no-store" });
+    if (r.status === 401) {
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+      window.location.href = "/login?e=sesion";
+      return null;
+    }
+    return r.ok ? ((await r.json()) as Me) : null;
+  } catch {
+    return null;
+  }
 }
 
 export default function Home() {
@@ -155,6 +174,8 @@ export default function Home() {
   const [locating, setLocating] = useState(false);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [me, setMe] = useState<Me | null>(null);
+  // "Cambiar mi contraseña" (forced = entró con contraseña temporal).
+  const [pwModal, setPwModal] = useState<null | "self" | "forced">(null);
   // Paginación / caché de la búsqueda (opcionales según la respuesta).
   const [lastQuery, setLastQuery] = useState<SearchQuery | null>(null);
   const [nextPageToken, setNextPageToken] = useState<string | null>(null);
@@ -166,7 +187,8 @@ export default function Home() {
     useState<ProspectFilters>(DEFAULT_PROSPECT_FILTERS);
   const [prospectsKey, setProspectsKey] = useState(0);
 
-  // Quién está logueado (para dueño, permisos y {{vendedor}}).
+  // Quién está logueado (para dueño, permisos y {{vendedor}}). Si entró con
+  // contraseña temporal, se le pide cambiarla.
   useEffect(() => {
     fetch("/api/auth/me")
       .then((r) => (r.ok ? r.json() : null))
@@ -174,9 +196,28 @@ export default function Home() {
         if (!d?.email) return;
         setMe(d);
         setContactSel(loadContactSel(d.email)); // filtros que dejó este usuario
+        if (d.mustChangePassword) setPwModal("forced");
       })
       .catch(() => {});
   }, []);
+
+  // Al volver a la pestaña del navegador revisa la sesión: si la cortaron
+  // (desactivado, cambio de rol o de contraseña) manda al login.
+  useEffect(() => {
+    const onFocus = () => {
+      refreshMe().then((d) => d && setMe(d));
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
+  // Me edité en Equipo (nombre o rol): si ya no soy admin salgo de Equipo.
+  async function afterSelfChanged() {
+    const d = await refreshMe();
+    if (!d) return;
+    setMe(d);
+    if (!d.isAdmin) setTab("investigar");
+  }
 
   // Fuentes del servidor: con DENUE_TOKEN y Google el modo por defecto es Mixta;
   // solo con DENUE_TOKEN, DENUE.
@@ -597,8 +638,9 @@ export default function Home() {
               </p>
             </div>
           </div>
-          <nav className="flex max-w-full gap-1 overflow-x-auto rounded-full bg-black/[0.04] p-1 [scrollbar-width:none]">
-            {TABS.map((t) => (
+          <div className="flex min-w-0 max-w-full items-center gap-2">
+          <nav className="flex min-w-0 max-w-full gap-1 overflow-x-auto rounded-full bg-black/[0.04] p-1 [scrollbar-width:none]">
+            {(me?.isAdmin ? ADMIN_TABS : TABS).map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -623,20 +665,23 @@ export default function Home() {
                   `Prospectos (${mineCount})`
                 ) : t === "metricas" ? (
                   "Métricas"
+                ) : t === "equipo" ? (
+                  <span className="flex items-center gap-1.5">
+                    <Icon.Users className="h-3.5 w-3.5" /> Equipo
+                  </span>
                 ) : (
                   t
                 )}
               </button>
             ))}
-            <button
-              onClick={logout}
-              title={me ? `Cerrar sesión (${me.email})` : "Cerrar sesión"}
-              aria-label="Cerrar sesión"
-              className="ml-1 grid h-8 w-8 shrink-0 place-items-center rounded-full text-slate-400 transition hover:bg-black/[0.04] hover:text-slate-700"
-            >
-              <Icon.LogOut className="h-4 w-4" />
-            </button>
           </nav>
+          <UserMenu
+            me={me}
+            onTeam={() => setTab("equipo")}
+            onPassword={() => setPwModal("self")}
+            onLogout={logout}
+          />
+          </div>
         </div>
       </header>
 
@@ -651,6 +696,7 @@ export default function Home() {
         )}
         {tab === "metricas" && <Dashboard />}
         {tab === "plantillas" && <Templates />}
+        {tab === "equipo" && me?.isAdmin && <Team me={me} onSelfChanged={afterSelfChanged} />}
         {tab === "prospectos" && (
           <Prospects
             me={me}
@@ -1089,6 +1135,15 @@ export default function Home() {
           </EmptyState>
         )}
       </main>
+
+      {pwModal && me && (
+        <PasswordModal
+          me={me}
+          forced={pwModal === "forced"}
+          onClose={() => setPwModal(null)}
+          onChanged={() => setMe((m) => (m ? { ...m, mustChangePassword: false } : m))}
+        />
+      )}
 
       {compose && (
         <ComposeModal

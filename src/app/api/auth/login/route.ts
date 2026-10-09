@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   AUTH_SECRET_ERROR,
   authConfigured,
-  checkCredentials,
+  sessionCookieOptions,
   signSession,
   SESSION_COOKIE,
 } from "@/lib/auth";
@@ -12,6 +12,7 @@ import {
   recordLoginAttempt,
   tooManyAttemptsMessage,
 } from "@/lib/rate-limit";
+import { UserDbError, checkCredentials } from "@/lib/users";
 
 export const runtime = "nodejs";
 
@@ -46,24 +47,39 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const ok = await checkCredentials(normEmail, password);
-    await recordLoginAttempt(normEmail, ip, ok);
-    if (!ok) {
+    // Usuarios de env (respaldo, no dependen de la BD) y de la tabla app_users.
+    let user: Awaited<ReturnType<typeof checkCredentials>>;
+    try {
+      user = await checkCredentials(normEmail, password);
+    } catch (err) {
+      if (err instanceof UserDbError) {
+        return NextResponse.json(
+          {
+            error:
+              "No se pudo verificar tu usuario: la base de datos no responde. Intenta de nuevo en un momento.",
+          },
+          { status: 503 }
+        );
+      }
+      throw err;
+    }
+    await recordLoginAttempt(normEmail, ip, !!user);
+    if (!user) {
       return NextResponse.json(
         { error: "Correo o contraseña incorrectos." },
         { status: 401 }
       );
     }
 
-    const token = await signSession(normEmail);
-    const res = NextResponse.json({ ok: true });
-    res.cookies.set(SESSION_COOKIE, token, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      path: "/",
-      maxAge: 7 * 86400,
+    const token =
+      user.source === "db"
+        ? await signSession({ email: user.email, src: "db", v: user.version, role: user.role })
+        : await signSession({ email: user.email, src: "env" });
+    const res = NextResponse.json({
+      ok: true,
+      mustChangePassword: user.source === "db" && user.mustChangePassword,
     });
+    res.cookies.set(SESSION_COOKIE, token, sessionCookieOptions());
     return res;
   } catch (err) {
     console.error("login error", err);

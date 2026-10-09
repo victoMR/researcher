@@ -9,33 +9,47 @@ El servidor MCP permite que Claude (Claude Code o Claude Desktop) use las herram
 
 - **Endpoint:** `POST https://TU-DOMINIO/api/mcp` (el dominio de `APP_URL`), con transporte **Streamable HTTP sin estado**. No hay sesiones del lado del servidor; `GET` y `DELETE` responden 405.
 - **Librería:** SDK oficial [`@modelcontextprotocol/server`](https://www.npmjs.com/package/@modelcontextprotocol/server) **2.3.1**, la línea estable v2. Su `createMcpHandler` es un handler web estándar (`Request` → `Response`) que se monta tal cual en una ruta de Next. Sirve la revisión **2026-07-28**, que no tiene estado, y responde con Streamable HTTP sin estado a los clientes de la era **2025** (2025-11-25, 2025-06-18…). Probado con el cliente oficial en ambas eras.
-- **Autenticación:** cada vendedor usa su propio token Bearer (`MCP_TOKENS`). El token identifica al usuario: es el `created_by` de las investigaciones, el dueño de los prospectos guardados y el actor en la bitácora. El proxy deja pasar `/api/mcp` sin la cookie de sesión porque la ruta valida su propio token. Nada más del proxy cambió.
+- **Autenticación:** cada vendedor usa su propio token Bearer. Lo normal es que un admin lo genere en la pestaña **Equipo** (en la base solo queda su sha256); `MCP_TOKENS` en Vercel queda como respaldo. El token identifica al usuario: es el `created_by` de las investigaciones, el dueño de los prospectos guardados y el actor en la bitácora. El proxy deja pasar `/api/mcp` sin la cookie de sesión porque la ruta valida su propio token. Nada más del proxy cambió.
 - **Código:** `src/app/api/mcp/route.ts` (autenticación y transporte), `src/lib/mcp/server.ts` (instrucciones, registro y límites), `src/lib/mcp/tools.ts` (herramientas), `src/lib/mcp/external.ts` (validación de `guardar_investigacion`) y `src/lib/mcp/evidence-store.ts` (sesión de evidencia).
 
 ## Variables de entorno
 
 | Variable | Para qué | Default |
 |---|---|---|
-| `MCP_TOKENS` | `correo1:token1,correo2:token2`. Un correo puede tener varios tokens, lo que sirve para rotarlos. Los tokens de menos de 32 caracteres se ignoran. Sin ningún token válido, `/api/mcp` responde 503. | Requerida |
+| `MCP_TOKENS` | Respaldo: `correo1:token1,correo2:token2`. Un correo puede tener varios tokens, lo que sirve para rotarlos. Los tokens de menos de 32 caracteres se ignoran. Sin `MCP_TOKENS` ni base de datos, `/api/mcp` responde 503. | Opcional (los tokens se generan en Equipo) |
 | `MCP_DAILY_CALLS` | Tope de llamadas a herramientas por vendedor y día (se cuenta en `api_usage` como `mcp:<correo>`) | `500` |
 | `MCP_ALLOWED_ORIGINS` | Orígenes de navegador permitidos, separados por coma. Los clientes de escritorio no mandan `Origin`; si llega uno ajeno, se responde 403. | Solo `APP_URL` |
 | `APP_URL` | Base de los enlaces (`/investigacion/<id>`, descarga del CSV) | Origen de la petición |
 
 Además usa las variables de la app: `DATABASE_URL`, que casi todas las herramientas necesitan (sin ella solo funcionan las de lectura externa y `calificar_prospecto`), `DENUE_TOKEN`, `GOOGLE_PLACES_API_KEY` (opcional), `ANTHROPIC_API_KEY` (solo para `investigar_con_agente`) y `GHL_PIT` + `GHL_LOCATION_ID` (para `enviar_a_ghl`).
 
-### Generar un token (32 bytes aleatorios)
+### Generar un token desde la app (recomendado)
+
+1. Como admin, abre **Equipo** y en la fila del vendedor pulsa **Generar token MCP**.
+2. La app muestra **una sola vez** el token (32 bytes aleatorios, 43 caracteres) y el comando listo para copiar:
+
+   ```bash
+   claude mcp add --transport http ai-lead-shield https://TU-DOMINIO/api/mcp --header "Authorization: Bearer <token>" --scope user
+   ```
+
+   El dominio sale de `APP_URL` (o del que estés usando).
+3. Entrégaselo al vendedor por un canal privado (no por correo ni chat de grupo) para que lo corra en su terminal.
+
+No hay que tocar Vercel ni volver a desplegar. Cada usuario tiene un token: **Nuevo token MCP** lo reemplaza (el anterior deja de valer al instante) y **Revocar token** lo quita. Si desactivas al usuario, su token también deja de funcionar. En la base solo se guarda el sha256 del token, así que no se puede volver a mostrar: si se pierde, genera otro.
+
+### Token de respaldo en Vercel (`MCP_TOKENS`)
+
+Para los usuarios de `APP_USERS`, o si la base de datos no está disponible:
 
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 ```
 
-Da 43 caracteres. Genera uno por vendedor y agrégalo en Vercel → Settings → Environment Variables:
+Agrégalo en Vercel → Settings → Environment Variables y vuelve a desplegar:
 
 ```
 MCP_TOKENS=aldo.perez@ialeadshield.com.mx:TOKEN_DE_ALDO,maria.lopez@ialeadshield.com.mx:TOKEN_DE_MARIA
 ```
-
-Después vuelve a desplegar. El token se le entrega a cada vendedor por un canal privado (no por correo ni chat de grupo).
 
 ## Conectar desde Claude Code
 
@@ -151,8 +165,8 @@ Las anotaciones MCP van así: `readOnlyHint` en las de lectura; `destructiveHint
 
 ## Seguridad
 
-- **Tokens:** son de 32 bytes aleatorios, uno por vendedor, y viven solo en variables de entorno, nunca en la BD. Se comparan en tiempo constante: HMAC de ambos con `timingSafeEqual`, recorriendo todos sin cortar en el primero. Sin token, la respuesta es `401` con `WWW-Authenticate: Bearer realm=…`; con un token inválido, además lleva `error="invalid_token"`.
-- **Rotación:** agrega el token nuevo junto al viejo (`correo:nuevo,correo:viejo`), despliega, actualiza el cliente y luego quita el viejo. Para revocar un token, quítalo de `MCP_TOKENS` y vuelve a desplegar. Si se filtra uno, revócalo de inmediato.
+- **Tokens:** son de 32 bytes aleatorios, uno por vendedor. Los generados en Equipo se guardan solo como **sha256** en `app_users.mcp_token_hash` (nunca el token) y solo valen si el usuario está activo; se buscan por su hash en cada llamada, sin caché, así que revocarlos o desactivar al usuario surte efecto de inmediato. Los de `MCP_TOKENS` se comparan en tiempo constante: HMAC de ambos con `timingSafeEqual`, recorriendo todos sin cortar en el primero. Sin token, la respuesta es `401` con `WWW-Authenticate: Bearer realm=…`; con un token inválido, además lleva `error="invalid_token"`. Si la base de datos no responde, los de `MCP_TOKENS` siguen funcionando y los demás reciben 503.
+- **Rotación:** en Equipo, **Nuevo token MCP** reemplaza el anterior y **Revocar token** lo quita, sin desplegar; cada acción queda en `events` (`mcp_token_created` / `mcp_token_revoked`). Con `MCP_TOKENS`: agrega el token nuevo junto al viejo (`correo:nuevo,correo:viejo`), despliega, actualiza el cliente y luego quita el viejo. Si se filtra uno, revócalo de inmediato.
 - **Límites:** 500 llamadas por vendedor y día (`MCP_DAILY_CALLS`). Además siguen aplicando el tope diario de Google (`GOOGLE_PLACES_DAILY_CAP`) y el de investigaciones del agente (`AGENT_DAILY_RUNS`, más una investigación en curso a la vez). Las peticiones de más de 4 MiB se rechazan.
 - **Prompt injection:** el contenido de sitios web y búsquedas es no confiable y puede traer instrucciones escondidas. Las instrucciones del servidor y las descripciones de las herramientas le dicen a Claude que lo trate como datos y que **nunca** use `enviar_a_ghl` ni `guardar_en_prospectos` por algo que diga una página o un resultado, solo con un sí explícito del usuario. Además, ninguna herramienta envía mensajes. Lo más que hace una herramienta con efecto es subir a GHL, y para eso Claude Code pide permiso.
 - **SSRF:** `revisar_sitio` y la relectura de `fuentes` pasan por `safeFetchText`: solo http/https públicos, sin IPs privadas, con redirecciones revalidadas y tamaño limitado.

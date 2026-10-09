@@ -9,7 +9,7 @@ import {
   updateLead,
   type LeadPatch,
 } from "@/lib/leads-repo";
-import { displayName, isAdmin, sessionEmail } from "@/lib/session";
+import { displayName, sessionUser } from "@/lib/session";
 import { LEAD_STATUSES } from "@/lib/types";
 import type { Lead, LeadStatus } from "@/lib/types";
 
@@ -33,9 +33,10 @@ function forbidden(lead: Lead, me: string, admin: boolean) {
 export async function PATCH(req: NextRequest, { params }: Ctx) {
   if (!hasDb()) return err("Sin base de datos.", 503);
   try {
-    const me = await sessionEmail(req);
-    if (!me) return err("No autorizado.", 401);
-    const admin = isAdmin(me);
+    const user = await sessionUser(req);
+    if (!user) return err("No autorizado.", 401);
+    const me = user.email;
+    const admin = user.isAdmin;
     const { id } = await params;
     const body = ((await req.json().catch(() => null)) ?? {}) as {
       status?: LeadStatus;
@@ -140,12 +141,12 @@ export async function PATCH(req: NextRequest, { params }: Ctx) {
 export async function DELETE(req: NextRequest, { params }: Ctx) {
   if (!hasDb()) return err("Sin base de datos.", 503);
   try {
-    const me = await sessionEmail(req);
-    if (!me) return err("No autorizado.", 401);
+    const user = await sessionUser(req);
+    if (!user) return err("No autorizado.", 401);
     const { id } = await params;
     const lead = await getLead(id);
     if (!lead) return NextResponse.json({ ok: true });
-    const denied = forbidden(lead, me, isAdmin(me));
+    const denied = forbidden(lead, user.email, user.isAdmin);
     if (denied) return denied;
     await removeLead(id);
     return NextResponse.json({ ok: true });

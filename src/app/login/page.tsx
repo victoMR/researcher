@@ -1,8 +1,27 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import * as Icon from "@/components/icons";
+
+// Aviso cuando el proxy manda aquí: ?e=sesion (la sesión ya no vale) o ?e=bd
+// (la base de datos no respondió al validarla).
+const NOTICES: Record<string, string> = {
+  sesion: "Tu sesión terminó (expiró o cambió tu acceso). Vuelve a iniciar sesión.",
+  bd: "No se pudo verificar tu sesión: la base de datos no responde. Intenta de nuevo en un momento.",
+};
+
+function LoginNotice({ hidden }: { hidden: boolean }) {
+  const e = useSearchParams().get("e");
+  const msg = e ? NOTICES[e] : null;
+  if (!msg || hidden) return null;
+  return (
+    <p className="mb-4 flex gap-2 rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-600">
+      <Icon.Info className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
+      <span>{msg}</span>
+    </p>
+  );
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -71,6 +90,10 @@ export default function LoginPage() {
             placeholder="••••••••"
             className="mb-4 w-full rounded-xl border-0 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:ring-2 focus:ring-indigo-500"
           />
+
+          <Suspense fallback={null}>
+            <LoginNotice hidden={!!error} />
+          </Suspense>
 
           {error && (
             <p className="mb-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">

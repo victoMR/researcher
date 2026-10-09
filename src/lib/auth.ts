@@ -75,15 +75,46 @@ function hmacKey(s: string): Promise<CryptoKey> {
   return keyCache.key;
 }
 
+export type Role = "admin" | "vendedor";
+
+// Origen del usuario: variables de entorno (APP_USERS / APP_LOGIN_*) o tabla app_users.
+export type UserSource = "env" | "db";
+
 export interface Session {
   email: string;
   exp: number; // epoch ms
+  // Sin `src` = cookie anterior a la tabla de usuarios (solo había usuarios de env).
+  src?: UserSource;
+  v?: number; // session_version del usuario de BD al firmar (si sube, la sesión deja de valer)
+  role?: Role; // rol al firmar (informativo: el vigente sale de la BD, ver session.ts)
 }
 
-export async function signSession(email: string, days = 7): Promise<string> {
+export const SESSION_DAYS = 7;
+
+// Atributos de la cookie de sesión (iguales al crearla y al borrarla).
+export function sessionCookieOptions(maxAgeSec = SESSION_DAYS * 86400) {
+  return {
+    httpOnly: true,
+    sameSite: "lax" as const,
+    secure: process.env.NODE_ENV === "production",
+    path: "/",
+    maxAge: maxAgeSec,
+  };
+}
+
+export async function signSession(
+  claims: { email: string; src: UserSource; v?: number; role?: Role },
+  days = SESSION_DAYS
+): Promise<string> {
   const s = secret();
   if (!s) throw new Error(AUTH_SECRET_ERROR);
-  const payload: Session = { email, exp: Date.now() + days * 86400000 };
+  const payload: Session = {
+    email: claims.email,
+    exp: Date.now() + days * 86400000,
+    src: claims.src,
+    ...(claims.v != null ? { v: claims.v } : {}),
+    ...(claims.role ? { role: claims.role } : {}),
+  };
   const body = toB64url(enc.encode(JSON.stringify(payload)));
   const sig = await crypto.subtle.sign("HMAC", await hmacKey(s), enc.encode(body));
   return `${body}.${toB64url(new Uint8Array(sig))}`;
@@ -111,13 +142,14 @@ export async function verifySession(token?: string | null): Promise<Session | nu
   }
 }
 
-// Usuarios permitidos. Soporta:
+// Usuarios de variables de entorno (respaldo / arranque; siempre activos).
+// Los demás se dan de alta desde la app (tabla app_users, ver users.ts). Soporta:
 //  - APP_LOGIN_EMAIL + APP_LOGIN_PASSWORD (un usuario)
 //  - APP_USERS = "correo1:clave1,correo2:clave2" (varios usuarios)
 // La clave puede ir en texto plano o como hash scrypt: "scrypt$<salt>$<hash>"
 // (hex). También se acepta ":" como separador ("scrypt:<salt>:<hash>"), útil en
 // archivos .env, donde Next expande "$VAR" (ahí hay que escribir "\$").
-function allowedUsers(): { email: string; password: string }[] {
+function envUsers(): { email: string; password: string }[] {
   const users: { email: string; password: string }[] = [];
   if (process.env.APP_LOGIN_EMAIL && process.env.APP_LOGIN_PASSWORD) {
     users.push({
@@ -136,6 +168,28 @@ function allowedUsers(): { email: string; password: string }[] {
     }
   }
   return users;
+}
+
+// Correos de los usuarios de env.
+export function envUserEmails(): Set<string> {
+  return new Set(envUsers().map((u) => u.email));
+}
+
+// Administradores por env: APP_ADMINS = "a@x.com,b@x.com". Si no está
+// definida, el usuario de APP_LOGIN_EMAIL es el admin. (También son admins
+// los usuarios con role 'admin' en la tabla app_users; ver session.ts.)
+export function envAdminEmails(): Set<string> {
+  const raw = process.env.APP_ADMINS ?? process.env.APP_LOGIN_EMAIL ?? "";
+  return new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+export function isEnvAdmin(email: string | null | undefined): boolean {
+  return !!email && envAdminEmails().has(email.trim().toLowerCase());
 }
 
 // Llave aleatoria por proceso: se usa para comparar cadenas en tiempo
@@ -162,8 +216,38 @@ function scryptAsync(password: string, salt: Buffer, keylen: number): Promise<Bu
 
 let warnedBadHash = false;
 
+// Hash para guardar (mismo formato que acepta verifyPassword): scrypt:<salt hex>:<hash hex>.
+export async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16);
+  const key = await scryptAsync(password, salt, 32);
+  return `scrypt:${salt.toString("hex")}:${key.toString("hex")}`;
+}
+
+// Hash de una clave al azar: se verifica contra él cuando el correo no existe,
+// para que la respuesta tarde lo mismo exista o no el usuario.
+let dummy: Promise<string> | null = null;
+export function dummyPasswordHash(): Promise<string> {
+  dummy ??= hashPassword(randomBytes(16).toString("hex"));
+  return dummy;
+}
+
+// Contraseña aleatoria legible: 4 bloques de 5 caracteres sin ambiguos
+// (0/O, 1/l/I), p. ej. "kT7mp-Qa2Xw-..." (~115 bits). Muestreo por rechazo
+// para que todos los caracteres sean igual de probables.
+const PW_ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+export function generatePassword(): string {
+  const limit = 256 - (256 % PW_ALPHABET.length);
+  let out = "";
+  while (out.length < 20) {
+    for (const b of randomBytes(32)) {
+      if (b < limit && out.length < 20) out += PW_ALPHABET[b % PW_ALPHABET.length];
+    }
+  }
+  return out.match(/.{5}/g)!.join("-");
+}
+
 // Verifica una clave contra lo guardado (texto plano o hash scrypt).
-async function verifyPassword(password: string, stored: string): Promise<boolean> {
+export async function verifyPassword(password: string, stored: string): Promise<boolean> {
   // Todo lo que empiece con "scrypt" se trata como hash. Si está mal formado
   // (p. ej. Next expandió los "$" del .env) NUNCA coincide, para no aceptar
   // como clave el texto que haya sobrado (como "scrypt").
@@ -190,13 +274,14 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
   return safeEqual(password, stored);
 }
 
-// Compara credenciales contra los usuarios permitidos. Recorre TODOS los
-// usuarios (sin cortar en el primer match) y compara en tiempo constante, para
-// no filtrar por tiempo de respuesta qué correos existen.
-export async function checkCredentials(email: string, password: string): Promise<boolean> {
+// Compara credenciales contra los usuarios de env. Recorre TODOS los usuarios
+// (sin cortar en el primer match) y compara en tiempo constante, para no
+// filtrar por tiempo de respuesta qué correos existen. El login completo (env
+// + tabla app_users) está en users.ts: checkCredentials.
+export async function checkEnvCredentials(email: string, password: string): Promise<boolean> {
   const e = email.trim().toLowerCase();
   const results = await Promise.all(
-    allowedUsers().map(async (u) => {
+    envUsers().map(async (u) => {
       const emailOk = safeEqual(u.email, e);
       const passOk = await verifyPassword(password, u.password);
       return emailOk && passOk;

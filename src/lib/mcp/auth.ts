@@ -1,10 +1,14 @@
 // Autenticación y límites del servidor MCP (/api/mcp).
-// Cada vendedor tiene su propio token: MCP_TOKENS = "correo1:token1,correo2:token2"
-// (un correo puede tener varios tokens para rotarlos sin cortar el servicio).
+// Cada vendedor tiene su propio token, de dos fuentes:
+//  - Tabla app_users: el admin lo genera en la pestaña Equipo; solo se guarda
+//    su sha256 (mcp_token_hash) y solo vale si el usuario está activo.
+//  - MCP_TOKENS = "correo1:token1,correo2:token2" (respaldo en Vercel; un
+//    correo puede tener varios tokens para rotarlos sin cortar el servicio).
 // El token identifica al usuario: created_by de las investigaciones, dueño de
 // los prospectos guardados y bitácora. Tokens de 32+ caracteres (p. ej.
 // `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`).
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { getSql, hasDb } from "../db";
 
 const MIN_TOKEN_LEN = 32;
 const DEFAULT_DAILY_CALLS = 500;
@@ -45,9 +49,24 @@ function entries(): TokenEntry[] {
   return list;
 }
 
-/** ¿Hay al menos un token válido configurado? */
+/** ¿Puede haber tokens válidos? (MCP_TOKENS o la tabla app_users en la BD). */
 export function mcpConfigured(): boolean {
-  return entries().length > 0;
+  return entries().length > 0 || hasDb();
+}
+
+/** Correos con token en MCP_TOKENS (para mostrarlo en Equipo). */
+export function envMcpTokenEmails(): Set<string> {
+  return new Set(entries().map((e) => e.email));
+}
+
+/** Lo que se guarda de un token de la tabla: sha256 en hex (nunca el token). */
+export function hashMcpToken(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+/** Token nuevo: 32 bytes aleatorios en base64url (43 caracteres). */
+export function newMcpToken(): string {
+  return randomBytes(32).toString("base64url");
 }
 
 /** "Authorization: Bearer <token>" -> token (o null). */
@@ -57,10 +76,10 @@ export function bearerToken(header: string | null | undefined): string | null {
 }
 
 /**
- * Correo del dueño del token, o null. Recorre TODOS los tokens sin cortar en
- * el primero que coincide (tiempo constante respecto a cuál coincidió).
+ * Correo del dueño de un token de MCP_TOKENS, o null. Recorre TODOS los tokens
+ * sin cortar en el primero que coincide (tiempo constante respecto a cuál coincidió).
  */
-export function emailForToken(token: string): string | null {
+export function emailForEnvToken(token: string): string | null {
   const d = digest(token);
   let found: string | null = null;
   for (const e of entries()) {
@@ -68,6 +87,27 @@ export function emailForToken(token: string): string | null {
     if (ok && found === null) found = e.email;
   }
   return found;
+}
+
+/**
+ * Correo del dueño del token (MCP_TOKENS primero; luego la tabla, buscando por
+ * sha256 y solo usuarios activos), o null. Si la BD falla lanza el error (la
+ * ruta responde 503): no se puede saber si el token sigue vigente.
+ */
+export async function emailForToken(token: string): Promise<string | null> {
+  const env = emailForEnvToken(token);
+  if (env) return env;
+  if (!hasDb() || token.length < MIN_TOKEN_LEN || token.length > 512) return null;
+  try {
+    const rows = await getSql()`
+      SELECT email FROM app_users WHERE mcp_token_hash = ${hashMcpToken(token)} AND active
+    `;
+    return rows.length ? String(rows[0].email) : null;
+  } catch (e) {
+    // La tabla aún no existe (nadie ha generado tokens desde la app).
+    if ((e as { code?: string }).code === "42P01") return null;
+    throw e;
+  }
 }
 
 // ---------- Límites ----------

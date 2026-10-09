@@ -149,6 +149,22 @@ export async function recordLoginAttempt(email: string, ip: string, ok: boolean)
   }
 }
 
+// Quita el bloqueo por correo (p. ej. al restablecer la contraseña): registra
+// un éxito, y el límite por correo solo cuenta los fallos posteriores.
+export async function clearLoginFailures(email: string): Promise<void> {
+  const ek = emailKey(email);
+  try {
+    if (hasDb()) {
+      await ensureSchema();
+      await getSql()`INSERT INTO login_attempts (key, ok) VALUES (${ek}, true)`;
+    } else {
+      memRecord(ek, true, Date.now());
+    }
+  } catch (err) {
+    console.error("[rate-limit] no se pudo limpiar el bloqueo", err);
+  }
+}
+
 // Mensaje para el 429.
 export function tooManyAttemptsMessage(retryAfterSec: number): string {
   const min = Math.max(1, Math.ceil(retryAfterSec / 60));

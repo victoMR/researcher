@@ -69,6 +69,8 @@ const OWN_TABLES: Record<string, string> = {
   login_attempts: "ok",
   research_runs: "prompt",
   mcp_evidence: "businesses",
+  // Firma: mcp_token_hash (un "app_users" ajeno bien podría tener password_hash).
+  app_users: "mcp_token_hash",
 };
 
 async function assertNoForeignTables(sql: Sql): Promise<void> {
@@ -320,6 +322,29 @@ async function migrate(sql: Sql): Promise<void> {
       google_calls  INTEGER NOT NULL DEFAULT 0,
       started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `;
+
+  // Usuarios dados de alta desde la app (pestaña Equipo). Los de APP_USERS /
+  // APP_LOGIN_* siguen en variables de entorno (respaldo) y no van aquí.
+  // password_hash: "scrypt:<salt>:<hash>" (src/lib/auth.ts). session_version:
+  // subirlo invalida todas las sesiones abiertas del usuario. Del token MCP
+  // solo se guarda su sha256 (hex), nunca el token.
+  await sql`
+    CREATE TABLE IF NOT EXISTS app_users (
+      email                 TEXT PRIMARY KEY CHECK (email = lower(email)),
+      name                  TEXT NOT NULL DEFAULT '',
+      role                  TEXT NOT NULL DEFAULT 'vendedor' CHECK (role IN ('admin', 'vendedor')),
+      password_hash         TEXT NOT NULL,
+      active                BOOLEAN NOT NULL DEFAULT true,
+      must_change_password  BOOLEAN NOT NULL DEFAULT true,
+      session_version       INTEGER NOT NULL DEFAULT 1,
+      mcp_token_hash        TEXT UNIQUE,
+      mcp_token_created_at  TIMESTAMPTZ,
+      created_by            TEXT,
+      created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_login_at         TIMESTAMPTZ
     )
   `;
 

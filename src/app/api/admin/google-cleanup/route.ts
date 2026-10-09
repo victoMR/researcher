@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasDb } from "@/lib/db";
 import { googleCleanup } from "@/lib/leads-repo";
-import { isAdmin, sessionEmail } from "@/lib/session";
+import { sessionUser } from "@/lib/session";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -29,8 +29,9 @@ export async function POST(req: NextRequest) {
       { status: 503 }
     );
   }
-  const me = await sessionEmail(req);
-  if (!isAdmin(me)) {
+  const user = await sessionUser(req);
+  const me = user?.email ?? null;
+  if (!user?.isAdmin) {
     return NextResponse.json(
       { error: "Solo un administrador puede limpiar los datos de Google." },
       { status: 403 }

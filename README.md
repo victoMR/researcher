@@ -21,7 +21,7 @@ npm install
 npm run dev
 ```
 
-Necesita al menos `DATABASE_URL` (Postgres de Supabase), `AUTH_SECRET` y un usuario (`APP_LOGIN_EMAIL` y `APP_LOGIN_PASSWORD`). La lista completa de variables está en [docs/README.md](docs/README.md#variables-de-entorno).
+Necesita al menos `DATABASE_URL` (Postgres de Supabase), `AUTH_SECRET` y un admin de respaldo (`APP_LOGIN_EMAIL` y `APP_LOGIN_PASSWORD`). Los vendedores se dan de alta desde la app, en la pestaña Equipo ([docs/README.md](docs/README.md#usuarios)). La lista completa de variables está en [docs/README.md](docs/README.md#variables-de-entorno).
 
 ## Documentación
 

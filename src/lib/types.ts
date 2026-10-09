@@ -81,6 +81,25 @@ export interface Me {
   email: string;
   name: string;
   isAdmin: boolean;
+  role?: "admin" | "vendedor";
+  source?: "env" | "db"; // env = definido en Vercel (APP_USERS); db = dado de alta en Equipo
+  mustChangePassword?: boolean; // entró con contraseña temporal
+}
+
+// Integrante del equipo (GET /api/users, solo admins).
+export interface TeamMember {
+  email: string;
+  name: string;
+  role: "admin" | "vendedor"; // rol efectivo (incluye APP_ADMINS)
+  envAdmin: boolean; // admin por APP_ADMINS / APP_LOGIN_EMAIL (no se quita desde la app)
+  active: boolean;
+  source: "env" | "db"; // env = definido en Vercel, solo lectura
+  mustChangePassword: boolean;
+  lastLoginAt: string | null; // ISO
+  createdAt: string | null; // ISO
+  createdBy: string | null;
+  hasMcpToken: boolean;
+  mcpTokenCreatedAt: string | null; // ISO (solo tokens generados en la app)
 }
 
 export interface SearchResponse {

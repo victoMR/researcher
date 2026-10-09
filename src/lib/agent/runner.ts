@@ -367,7 +367,13 @@ export async function runResearch(o: RunInput): Promise<void> {
       if (!ev.hasData()) throw new AgentFail(NO_DATA_MESSAGE[end]);
       const why = apiFailure ? friendlyApiError(apiFailure, model) : PARTIAL_MESSAGE[end];
       say({ at: nowIso(), kind: "warn", message: `${why} Armé el reporte con los datos ya reunidos.` });
-      const fb = fallbackReport(ev, { max: maxResults, nowIso: now, vendorName, prompt: o.prompt });
+      const fb = fallbackReport(ev, {
+        max: maxResults,
+        nowIso: now,
+        vendorName,
+        prompt: o.prompt,
+        reason: apiFailure ? "api" : end,
+      });
       prospects = fb.prospects;
       summary = fb.summary;
     }
@@ -445,9 +451,15 @@ async function agentLoop(o: LoopInput): Promise<{ draft: Draft | null; end?: End
       }),
     },
   ];
+  // Contenedor de la ejecución de código (la búsqueda/lectura web _20260209 filtra
+  // con código). Si Claude llamó nuestras herramientas desde ese código, la API
+  // EXIGE el id del contenedor en la siguiente solicitud; reusarlo siempre es válido.
+  let containerId: string | undefined;
+
   // Mismos parámetros en cada vuelta (tools + system idénticos -> caché).
   const request = (): MessageCreateParamsNonStreaming => ({
     model,
+    ...(containerId ? { container: containerId } : {}),
     max_tokens: MAX_OUTPUT_TOKENS,
     system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
     tools,
@@ -489,6 +501,7 @@ async function agentLoop(o: LoopInput): Promise<{ draft: Draft | null; end?: End
         throw e;
       }
       usage.add(msg.usage);
+      if (msg.container?.id) containerId = msg.container.id;
       harvestWeb(msg.content, ev);
 
       if (msg.stop_reason === "refusal") {
@@ -583,7 +596,13 @@ async function agentLoop(o: LoopInput): Promise<{ draft: Draft | null; end?: End
       const note = wrapUp
         ? `[Hora de entregar] Se acabó el tiempo de investigación. Llama AHORA a ${REPORT_TOOL_NAME} con los mejores prospectos que ya tienes (máx. ${o.maxResults}); no uses otras herramientas. Razones de una línea y mensajes de 35 a 50 palabras.`
         : `[Presupuesto] Quedan ~${left} s y ${turnsLeft} turnos para investigar; búsquedas web usadas: ${usage.searches}. Máximo ${o.maxResults} prospectos en el reporte.`;
-      messages.push({ role: "user", content: [...results, { type: "text", text: note }] });
+      // Si alguna llamada vino desde la ejecución de código (llamada programática),
+      // la respuesta debe llevar SOLO tool_result: la nota se manda en otro turno.
+      const programmatic = uses.some((u) => u.caller && u.caller.type !== "direct");
+      messages.push({
+        role: "user",
+        content: programmatic ? results : [...results, { type: "text", text: note }],
+      });
     }
   } finally {
     clearTimeout(hardTimer);

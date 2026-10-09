@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ResearchProspect, ResearchRun } from "@/lib/research-types";
 import type { Business, Me } from "@/lib/types";
 import { personName } from "@/lib/format";
+import { hasMxWhatsappNumber } from "@/lib/contact-filters";
 import ComposeModal from "@/components/ComposeModal";
 import MapView from "@/components/MapView";
 import { EmptyState } from "@/components/ui";
@@ -41,6 +42,9 @@ type Notice = { tone: "ok" | "warn" | "error"; text: string; detail?: string[] }
 type Busy = "csv" | "ghl" | "save" | null;
 
 const hasEmail = (p: ResearchProspect) => !!(p.email || p.emails?.length);
+// Mismo criterio que los filtros de Buscar/Prospectos: WhatsApp detectado en
+// su web o un teléfono MX válido.
+const hasWhatsapp = (p: ResearchProspect) => !!p.whatsapp || hasMxWhatsappNumber(p.phone);
 const wasContacted = (p: ResearchProspect) =>
   !!(
     p.existing?.contactedBy ||
@@ -136,7 +140,7 @@ export default function ResearchReport({
       results.filter(
         (p) =>
           (!filters.email || hasEmail(p)) &&
-          (!filters.wa || !!p.whatsapp) &&
+          (!filters.wa || hasWhatsapp(p)) &&
           (!filters.top || p.score >= 7) &&
           (!filters.hideContacted || !wasContacted(p))
       ),
@@ -163,7 +167,7 @@ export default function ResearchReport({
     total: results.length,
     withEmail: results.filter(hasEmail).length,
     withPhone: results.filter((p) => !!p.phone).length,
-    withWhatsapp: results.filter((p) => !!p.whatsapp).length,
+    withWhatsapp: results.filter(hasWhatsapp).length,
   };
 
   // Mapa: solo DENUE / OSM / web con coordenadas (términos de Google).

@@ -8,6 +8,7 @@
 //   sale de computeScore() (modelo por resta), no del modelo de IA.
 import type { ResearchProspect, ResearchSource, ResearchSummary } from "../research-types";
 import { computeScore } from "../scoring";
+import { hasMxWhatsappNumber } from "../contact-filters";
 import { displayPhoneMx, phoneKey } from "../email-extract";
 import { cleanPhone, type Evidence, type SeenBusiness } from "./evidence";
 import {
@@ -500,7 +501,8 @@ export function buildSummary(
       total: prospects.length,
       withEmail: prospects.filter((p) => p.email && !p.emailIsGuess).length,
       withPhone: prospects.filter((p) => p.phone).length,
-      withWhatsapp: prospects.filter((p) => p.whatsapp).length,
+      // Mismo criterio que los filtros: WhatsApp detectado o teléfono MX válido.
+      withWhatsapp: prospects.filter((p) => p.whatsapp || hasMxWhatsappNumber(p.phone)).length,
     },
   };
 }
@@ -521,24 +523,66 @@ function autoReasons(p: ResearchProspect): string[] {
   return r.slice(0, 3);
 }
 
-function genericOpener(name: string, niche: string, vendor: string): string {
-  return `Hola, equipo de ${name}. Le escribo de AI Lead Shield: ayudamos a ${niche.toLowerCase()} a responder al instante por WhatsApp y en su web, dar seguimiento automático y agendar citas sin perder prospectos. ¿Le interesaría ver cómo funcionaría en su negocio en una llamada de 15 minutos esta semana? — ${vendor}, AI Lead Shield`;
+function genericOpener(name: string, vendor: string): string {
+  return `Hola, equipo de ${name}. Le escribo de AI Lead Shield: ayudamos a negocios como el suyo a responder al instante por WhatsApp y en su web, dar seguimiento automático y agendar citas sin perder prospectos. ¿Le interesaría ver cómo funcionaría en su negocio en una llamada de 15 minutos esta semana? — ${vendor}, AI Lead Shield`;
 }
 
-/** Arma un reporte con lo reunido cuando el modelo no entregó a tiempo. */
+// Palabras que no sirven para decidir el giro: «taller» trae carpinterías,
+// composturas de ropa, joyerías…; DENUE combina las palabras con O.
+const GENERIC_WORDS = new Set([
+  "taller", "talleres", "servicio", "servicios", "tienda", "tiendas", "negocio", "negocios",
+  "comercio", "empresa", "empresas", "centro", "clientes", "venta", "ventas", "local", "general",
+]);
+
+const foldText = (s: string) =>
+  s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+// Raíces (5 letras) de las palabras distintivas del nicho: "refaccionaria" -> "refac".
+export function nicheStems(keywords: Iterable<string>): string[] {
+  const out = new Set<string>();
+  for (const k of keywords) {
+    for (const w of foldText(k).split(/[^a-z0-9]+/)) {
+      if (w.length < 4 || GENERIC_WORDS.has(w)) continue;
+      out.add(w.slice(0, 5));
+    }
+  }
+  return [...out];
+}
+
+// ¿El nombre o la actividad del negocio tiene alguna raíz del nicho?
+export function matchesNiche(b: Pick<SeenBusiness, "name" | "category">, stems: string[]): boolean {
+  const words = foldText(`${b.name} ${b.category ?? ""}`).split(/[^a-z0-9]+/);
+  return words.some((w) => stems.some((st) => w.startsWith(st)));
+}
+
+export type FallbackReason = "api" | "time" | "turns" | "refusal" | "no_report";
+
+const FALLBACK_WHY: Record<FallbackReason, string> = {
+  api: "Hubo un error con la IA a media investigación",
+  time: "La IA no alcanzó a terminar el análisis a tiempo",
+  turns: "La IA usó todos sus pasos sin terminar el análisis",
+  refusal: "La IA no quiso continuar con esta investigación",
+  no_report: "La IA no entregó el análisis",
+};
+
+/** Arma un reporte con lo reunido cuando el modelo no entregó su análisis. */
 export function fallbackReport(
   ev: Evidence,
-  o: { max: number; nowIso: string; vendorName: string; prompt: string }
+  o: { max: number; nowIso: string; vendorName: string; prompt: string; reason?: FallbackReason }
 ): { prospects: ResearchProspect[]; summary: ResearchSummary } {
   const niche = [...ev.keywords][0] ?? "negocios";
+  // Solo negocios del giro pedido (si el filtro dejara cero, se listan todos).
+  const stems = nicheStems(ev.keywords);
+  const pool = [...ev.businesses.values()].filter((b) => b.source !== "google");
+  const relevant = stems.length ? pool.filter((b) => matchesNiche(b, stems)) : pool;
+  const chosen = relevant.length ? relevant : pool;
   const works: Work[] = [];
-  for (const b of ev.businesses.values()) {
-    if (b.source === "google") continue;
+  for (const b of chosen) {
     const w = fromEntity(b, null, niche);
     attachGoogle(w, googleTwin(b, ev));
     attachSite(w, ev);
     w.p.reasons = autoReasons(w.p);
-    w.p.opener = genericOpener(w.p.name, niche, o.vendorName);
+    w.p.opener = genericOpener(w.p.name, o.vendorName);
     works.push(w);
   }
   const { out } = dedupe(works);
@@ -551,8 +595,13 @@ export function fallbackReport(
       niche,
       zone,
       overview:
-        "**Reporte automático.** La IA no alcanzó a terminar el análisis a tiempo, así que esta lista se armó con los datos que ya se habían reunido (DENUE, OpenStreetMap y sitios revisados), sin análisis detallado ni mensajes personalizados.",
-      insights: [`Se reunieron ${prospects.length} negocios con datos abiertos.`],
+        `**Reporte automático.** ${FALLBACK_WHY[o.reason ?? "no_report"]}, así que esta lista se armó con los datos que ya se habían reunido (DENUE, OpenStreetMap y sitios revisados), sin análisis detallado ni mensajes personalizados.`,
+      insights: [
+        `Se reunieron ${prospects.length} negocios del giro con datos abiertos.`,
+        ...(relevant.length && relevant.length < pool.length
+          ? [`Se descartaron ${pool.length - relevant.length} negocios de otros giros que aparecieron en la búsqueda.`]
+          : []),
+      ],
       nextSteps: [
         "Revisa a mano los primeros de la lista.",
         "Vuelve a lanzar la investigación con una zona o un nicho más acotado para obtener el análisis completo.",
